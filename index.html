@@ -1,0 +1,1030 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<title>Dead reckoning — a path integration trainer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#080C0B; --surface:#101917; --surface-2:#16211D;
+    --line:#243330; --text:#E7ECE9; --text-muted:#7C948B;
+    --accent:#7FE3B4; --accent-2:#F2A65A; --danger:#E2685A; --focus:#9FEFC9;
+    --font-sans:'IBM Plex Sans', system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-mono:'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  *{ box-sizing:border-box; }
+  html,body{ height:100%; }
+  body{
+    margin:0; min-height:100vh; display:flex; align-items:flex-start; justify-content:center;
+    padding:22px 16px;
+    background:radial-gradient(ellipse at 50% -10%, #13201c 0%, var(--bg) 62%);
+    background-attachment:fixed;
+    color:var(--text); font-family:var(--font-sans);
+  }
+  .panel{ background:var(--surface); border:1px solid var(--line); border-radius:6px; padding:22px 22px 20px; }
+
+  /* one column by default; two on a monitor, with the stage held in view */
+  .shell{ width:100%; max-width:480px; display:grid; grid-template-columns:1fr; gap:16px; align-items:start; }
+
+  @media (min-width:920px){
+    body{ padding:24px 24px 24px; }
+    .shell{ max-width:1200px; grid-template-columns:minmax(0,1.3fr) minmax(330px,.8fr); gap:20px; }
+    .col-left{ position:sticky; top:24px; max-height:calc(100vh - 48px); overflow:visible; }
+    /* the page itself scrolls: one familiar scrollbar, no nested scroll area.
+       the stage stays pinned in view while the settings move past it. */
+    .col-left{ align-self:start; }
+    .col-right{ align-self:start; }
+  }
+  @media (min-width:1400px){
+    .shell{ max-width:1340px; grid-template-columns:minmax(0,1.45fr) minmax(360px,.72fr); }
+  }
+
+  /* visible, themed scrollbars rather than the OS default overlay */
+  .col-right::-webkit-scrollbar,
+  body::-webkit-scrollbar{ width:11px; }
+  .col-right::-webkit-scrollbar-track,
+  body::-webkit-scrollbar-track{ background:rgba(255,255,255,.03); border-radius:6px; }
+  .col-right::-webkit-scrollbar-thumb,
+  body::-webkit-scrollbar-thumb{ background:#3E5A50; border-radius:6px; border:2px solid transparent; background-clip:padding-box; }
+  .col-right::-webkit-scrollbar-thumb:hover,
+  body::-webkit-scrollbar-thumb:hover{ background:var(--text-muted); background-clip:padding-box; }
+
+  header{ display:flex; justify-content:space-between; align-items:flex-start; gap:14px; margin-bottom:14px; }
+  h1{ font-size:1.25rem; margin:0 0 3px; font-weight:600; }
+  .subtitle{ margin:0; color:var(--text-muted); font-size:.82rem; line-height:1.4; max-width:32ch; }
+  .level-badge{ font-family:var(--font-mono); font-size:.64rem; color:var(--text-muted); text-align:right; white-space:nowrap; letter-spacing:.06em; }
+  .level-badge b{ display:block; font-size:1.35rem; color:var(--accent); font-weight:600; margin-top:2px; }
+
+  .hidden{ display:none !important; }
+
+  .stage{ position:relative; width:100%; aspect-ratio:4/3; max-height:none; background:#050807; border:1px solid var(--line); border-radius:4px; overflow:hidden; margin-bottom:10px; touch-action:none; }
+  canvas#view{ display:block; width:100%; height:100%; }
+  .overlay-msg{
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    text-align:center; padding:20px; font-family:var(--font-mono); font-size:.82rem;
+    color:var(--text-muted); line-height:1.6; pointer-events:none;
+  }
+  .overlay-msg:not(:empty) > span{
+    background:rgba(5,8,7,.82); border:1px solid var(--line); border-radius:4px;
+    padding:9px 14px; backdrop-filter:blur(2px);
+  }
+  .overlay-msg b{ color:var(--accent); font-weight:600; }
+  .w-legend{ position:absolute; bottom:8px; left:10px; display:flex; align-items:center; gap:5px;
+    font-family:var(--font-mono); font-size:.55rem; color:var(--text-muted); letter-spacing:.04em;
+    pointer-events:none; background:rgba(5,8,7,.72); padding:3px 7px; border-radius:10px; }
+  .w-legend i{ width:8px; height:8px; border-radius:50%; display:inline-block; }
+  .w-legend i.cold{ background:rgb(70,150,255); }
+  .w-legend i.mid{ background:rgb(190,220,208); margin-left:4px; }
+  .w-legend i.warm{ background:rgb(255,150,38); margin-left:4px; }
+  .dim-tag{ position:absolute; top:8px; right:10px; font-family:var(--font-mono); font-size:.6rem; color:var(--text-muted); letter-spacing:.08em; pointer-events:none; }
+  .mode-tag{ position:absolute; top:8px; left:10px; font-family:var(--font-mono); font-size:.6rem; color:var(--accent); letter-spacing:.08em; pointer-events:none; }
+
+  .phase-row{ display:flex; justify-content:space-between; align-items:baseline; font-family:var(--font-mono); font-size:.68rem; color:var(--text-muted); margin-bottom:12px; }
+  .phase-row span:first-child{ color:var(--accent); letter-spacing:.05em; }
+
+  button{ font-family:var(--font-sans); font-size:.85rem; font-weight:500; border-radius:4px; border:1px solid var(--line); background:var(--surface-2); color:var(--text); padding:11px 8px; cursor:pointer; transition:background .15s, border-color .15s; }
+  button:hover:not(:disabled){ border-color:var(--accent); }
+  button:disabled{ opacity:.35; cursor:not-allowed; }
+  button:focus-visible{ outline:2px solid var(--focus); outline-offset:2px; }
+  .primary{ background:var(--accent); color:#08130F; border-color:var(--accent); font-weight:600; }
+  .primary:disabled{ background:var(--surface-2); color:var(--text); border-color:var(--line); }
+
+  .action-row{ display:flex; gap:8px; margin-bottom:8px; }
+  .action-row button{ flex:1; }
+  #moveBtn{ flex:1.1; touch-action:none; user-select:none; -webkit-user-select:none; }
+  #backBtn{ flex:.75; touch-action:none; user-select:none; -webkit-user-select:none; }
+  #moveBtn.pressed, #backBtn.pressed{ background:var(--accent-2); color:#180D03; border-color:var(--accent-2); font-weight:600; }
+  .keyhint{
+    min-height:1.1em; font-family:var(--font-mono); font-size:.64rem;
+    color:var(--text-muted); text-align:center; margin-bottom:12px; line-height:1.5;
+  }
+  .keyhint kbd{
+    font-family:var(--font-mono); font-size:.62rem; background:var(--surface-2);
+    border:1px solid var(--line); border-radius:3px; padding:1px 4px; color:var(--text);
+  }
+  .aux-row{ display:flex; gap:8px; margin-bottom:14px; }
+  .aux-row button{ flex:1; font-size:.78rem; }
+
+  .feedback{ min-height:1.3em; text-align:center; font-family:var(--font-mono); font-size:.8rem; color:var(--text-muted); margin-bottom:14px; }
+  .feedback .good{ color:var(--accent); } .feedback .mid{ color:var(--accent-2); } .feedback .poor{ color:var(--danger); }
+
+  .stats{ display:grid; grid-template-columns:repeat(4,1fr); gap:8px; text-align:center; font-family:var(--font-mono); padding:13px 4px; border-top:1px solid var(--line); border-bottom:1px solid var(--line); margin-bottom:14px; }
+  .stats small{ display:block; font-size:.58rem; color:var(--text-muted); text-transform:uppercase; letter-spacing:.06em; }
+  .stats span{ display:block; font-size:1rem; color:var(--text); margin-top:3px; }
+
+  .spark-wrap{ margin-bottom:16px; }
+  svg#spark{ width:100%; height:32px; display:block; }
+  .spark-line{ fill:none; stroke:var(--text-muted); stroke-width:1.5; }
+  .spark-thresh{ stroke:var(--line); stroke-width:1; stroke-dasharray:2 3; }
+
+  .seg{ display:flex; border:1px solid var(--line); border-radius:4px; overflow:hidden; margin-bottom:10px; }
+  .seg button{ flex:1; border:none; border-radius:0; background:var(--surface-2); font-size:.72rem; padding:9px 4px; }
+  .seg button.active{ background:var(--accent); color:#08130F; font-weight:600; }
+  .seg-label{ font-size:.68rem; color:var(--text-muted); margin-bottom:5px; font-family:var(--font-mono); letter-spacing:.05em; }
+
+  .stair-info{ font-family:var(--font-mono); font-size:.6rem; color:var(--text-muted);
+    text-align:center; margin:-2px 0 12px; line-height:1.5; }
+  .seg-label .sub{ text-transform:none; letter-spacing:0; opacity:.75; }
+
+  .chips{ display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
+  .chips button{ flex:1 1 0; min-width:74px; font-size:.75rem; padding:9px 6px;
+    background:transparent; color:var(--text-muted); border:1px solid var(--line); }
+  .chips button.on{ background:var(--surface-2); color:var(--text); border-color:var(--accent); }
+  .chips button.locked{ opacity:.4; cursor:not-allowed; }
+
+  .level-row{ display:flex; align-items:stretch; gap:8px; margin-bottom:8px; }
+  .level-row button{ flex:0 0 56px; font-size:1.1rem; font-weight:600; }
+  .level-set{ flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    border:1px solid var(--line); border-radius:4px; background:var(--surface-2); padding:6px 4px; }
+  .level-set small{ font-family:var(--font-mono); font-size:.55rem; color:var(--text-muted); letter-spacing:.08em; }
+  .level-set b{ font-family:var(--font-mono); font-size:1.15rem; color:var(--accent); font-weight:600; }
+
+  .summary{ border:1px solid var(--line); border-radius:4px; padding:11px 12px; margin-bottom:8px;
+    font-family:var(--font-mono); font-size:.68rem; color:var(--text-muted); line-height:1.7; }
+  .summary .big{ display:flex; justify-content:space-between; margin-bottom:6px;
+    padding-bottom:6px; border-bottom:1px solid var(--line); }
+  .summary .big div{ text-align:center; flex:1; }
+  .summary .big span{ display:block; font-size:1.05rem; color:var(--text); }
+  .summary .big small{ font-size:.55rem; letter-spacing:.06em; text-transform:uppercase; }
+  .summary table{ width:100%; border-collapse:collapse; }
+  .summary td{ padding:1px 0; }
+  .summary td:first-child{ color:var(--text); }
+  .summary td:last-child{ text-align:right; }
+  .storage-note{ font-family:var(--font-mono); font-size:.58rem; color:var(--text-muted);
+    text-align:center; margin-bottom:12px; line-height:1.5; }
+  .readouts{ display:grid; grid-template-columns:repeat(4,1fr); gap:6px; margin-bottom:14px; font-family:var(--font-mono); font-size:.62rem; color:var(--text-muted); text-align:center; }
+  .readouts span{ display:block; color:var(--text); font-size:.82rem; margin-top:2px; }
+
+  .sliders{ display:flex; flex-direction:column; gap:11px; margin-bottom:14px; }
+  .slider-row{ display:flex; flex-direction:column; gap:3px; }
+  .slider-row .label-row{ display:flex; justify-content:space-between; font-size:.74rem; color:var(--text-muted); }
+  .slider-row .label-row output{ font-family:var(--font-mono); color:var(--text); }
+  input[type=range]{ accent-color:var(--accent); width:100%; }
+
+  #resetBtn{ width:100%; background:transparent; margin-bottom:4px; }
+
+  details.how{ margin-top:16px; font-size:.79rem; color:var(--text-muted); }
+  details.how summary{ cursor:pointer; color:var(--text); font-weight:500; margin-bottom:8px; }
+  details.how p{ line-height:1.55; margin:0 0 8px; }
+  footer.credit{ margin-top:14px; font-size:.68rem; color:var(--text-muted); text-align:center; line-height:1.5; }
+
+  @media (min-width:920px){
+    .stage{ aspect-ratio:16/10; }
+    .stats{ grid-template-columns:repeat(4,1fr); }
+  }
+  @media (min-width:920px) and (max-height:820px){
+    .stage{ aspect-ratio:16/9; }
+  }
+  .scroll-cue{
+    position:fixed; right:14px; bottom:14px; z-index:5;
+    display:none; align-items:center; gap:6px;
+    font-family:var(--font-mono); font-size:.62rem; color:var(--text-muted);
+    background:rgba(8,12,11,.9); border:1px solid var(--line); border-radius:20px;
+    padding:7px 12px; pointer-events:none;
+  }
+  .scroll-cue.show{ display:flex; }
+  .scroll-cue b{ color:var(--accent); font-weight:600; }
+
+  @media (prefers-reduced-motion:reduce){ *{ transition:none !important; } }
+  @media (max-width:380px){ .panel{ padding:20px 15px 16px; } .chips button{ min-width:66px; font-size:.7rem; } }
+</style>
+</head>
+<body>
+  <div class="shell">
+  <main class="panel col-left">
+
+    <header>
+      <div>
+        <h1>Dead reckoning</h1>
+        <p class="subtitle">Track where you started, using only the motion you see.</p>
+      </div>
+      <div class="level-badge">LEVEL<b id="levelBadge">1</b></div>
+    </header>
+
+    <div class="stage" id="stage">
+      <canvas id="view"></canvas>
+      <div class="mode-tag" id="modeTag">HOMING</div>
+      <div class="dim-tag" id="dimTag">2D</div>
+      <div class="w-legend hidden" id="wLegend"><i class="cold"></i>behind w<i class="mid"></i>level<i class="warm"></i>ahead w</div>
+      <div class="overlay-msg" id="overlay"><span>Press <b>Travel</b> to begin.</span></div>
+    </div>
+
+    <div class="phase-row">
+      <span id="phaseLabel">READY</span>
+      <span id="rightStatus"></span>
+    </div>
+
+    <div class="action-row">
+      <button id="backBtn" class="hidden">&#8592; Back</button>
+      <button id="moveBtn" class="hidden">Hold to move &#8594;</button>
+      <button id="mainBtn" class="primary">Travel</button>
+    </div>
+
+    <div class="keyhint" id="keyhint"></div>
+
+    <div class="aux-row hidden" id="auxRow">
+      <button id="anaMinus">&#8722; ana</button>
+      <button id="anaPlus">+ ana</button>
+    </div>
+
+    <div class="feedback" id="feedback"></div>
+
+    <div class="stats">
+      <div><small>Streak</small><span id="streakVal">0</span></div>
+      <div><small>Best</small><span id="bestVal">0</span></div>
+      <div><small>Avg score</small><span id="avgVal">&ndash;</span></div>
+      <div><small>Trials</small><span id="trialsVal">0</span></div>
+    </div>
+
+    <div class="spark-wrap">
+      <svg id="spark" viewBox="0 0 240 32" preserveAspectRatio="none">
+        <line class="spark-thresh" x1="0" y1="8" x2="240" y2="8"></line>
+        <polyline id="sparkLine" class="spark-line" points=""></polyline>
+      </svg>
+    </div>
+
+  </main>
+
+  <aside class="panel col-right">
+    <div class="seg-label">TASK TYPES <span class="sub">— tap to include or exclude</span></div>
+    <div class="chips" id="taskChips">
+      <button data-task="angle" class="on">Angle</button>
+      <button data-task="distance" class="on">Distance</button>
+      <button data-task="homing" class="on">Homing</button>
+      <button data-task="return" class="on">Renav</button>
+    </div>
+    <div class="stair-info" id="poolInfo"></div>
+
+    <div class="seg-label">PATH</div>
+    <div class="seg" id="pathSeg">
+      <button data-path="passive" class="active">Passive</button>
+      <button data-path="active">Active (you drive)</button>
+    </div>
+
+    <div class="seg-label">WORLD</div>
+    <div class="seg" id="dimSeg">
+      <button data-dim="0" class="active">Auto</button>
+      <button data-dim="2">2D</button>
+      <button data-dim="3">3D</button>
+      <button data-dim="4">4D</button>
+    </div>
+
+    <div class="seg-label">DIFFICULTY</div>
+    <div class="seg" id="adaptSeg">
+      <button data-adapt="auto" class="active">Staircase</button>
+      <button data-adapt="manual">Manual</button>
+    </div>
+
+    <div class="level-row" id="levelRow">
+      <button id="levelDown" aria-label="Lower the level">&minus;</button>
+      <div class="level-set"><small>LEVEL</small><b id="levelSetVal">1.0</b></div>
+      <button id="levelUp" aria-label="Raise the level">+</button>
+    </div>
+    <div class="stair-info" id="stairInfo"></div>
+
+    <div class="readouts" id="readoutGroup">
+      <div><small>Legs</small><span id="segReadout">&ndash;</span></div>
+      <div><small>Speed var</small><span id="jitReadout">&ndash;</span></div>
+      <div><small>Turn max</small><span id="turnReadout">&ndash;</span></div>
+      <div><small>Accel</small><span id="accelReadout">&ndash;</span></div>
+      <div><small>Flow</small><span id="flowReadout">&ndash;</span></div>
+      <div><small>Delay</small><span id="delayReadout">&ndash;</span></div>
+    </div>
+
+    <div class="sliders hidden" id="sliderGroup">
+      <div class="slider-row">
+        <div class="label-row"><label for="dimSlider">Dimensions</label><output id="dimOut">2D</output></div>
+        <input type="range" id="dimSlider" min="2" max="4" step="1" value="2">
+      </div>
+      <div class="slider-row">
+        <div class="label-row"><label for="segSlider">Legs per path</label><output id="segOut">2</output></div>
+        <input type="range" id="segSlider" min="2" max="14" step="1" value="2">
+      </div>
+      <div class="slider-row">
+        <div class="label-row"><label for="jitSlider">Speed variability</label><output id="jitOut">48%</output></div>
+        <input type="range" id="jitSlider" min="0" max="92" step="4" value="48">
+      </div>
+      <div class="slider-row">
+        <div class="label-row"><label for="accelSlider">Acceleration rate</label><output id="accelOut">0.60</output></div>
+        <input type="range" id="accelSlider" min="20" max="280" step="10" value="60">
+      </div>
+      <div class="slider-row">
+        <div class="label-row"><label for="turnSlider">Turn spread</label><output id="turnOut">1.30 rad</output></div>
+        <input type="range" id="turnSlider" min="40" max="305" step="5" value="130">
+      </div>
+      <div class="slider-row">
+        <div class="label-row"><label for="flowSlider">Flow density</label><output id="flowOut">220</output></div>
+        <input type="range" id="flowSlider" min="25" max="300" step="5" value="220">
+      </div>
+      <div class="slider-row">
+        <div class="label-row"><label for="lifeSlider">Dot lifetime</label><output id="lifeOut">2.5s</output></div>
+        <input type="range" id="lifeSlider" min="3" max="40" step="1" value="25">
+      </div>
+      <div class="slider-row">
+        <div class="label-row"><label for="delaySlider">Delay before report</label><output id="delayOut">0.0s</output></div>
+        <input type="range" id="delaySlider" min="0" max="6000" step="250" value="0">
+      </div>
+    </div>
+
+    <div class="seg-label hidden" id="cueLabel">4D CUES</div>
+    <div class="seg hidden" id="cueSeg">
+      <button data-cue="static" class="active">Colour + size</button>
+      <button data-cue="pulse">+ w-pulse</button>
+    </div>
+
+    <div class="seg-label">SOUND (pitch tracks speed)</div>
+    <div class="seg" id="audioSeg">
+      <button data-audio="off" class="active">Off</button>
+      <button data-audio="on">On</button>
+    </div>
+
+    <div class="seg-label">SESSION</div>
+    <div class="summary" id="summary"></div>
+    <div class="storage-note" id="storageNote"></div>
+
+    <button id="resetBtn">Reset session</button>
+
+    <details class="how">
+      <summary>How this works</summary>
+      <p>You are moved passively through a field of drifting points. Nothing marks your position, and the points are short-lived so none can be used as a landmark. Your speed varies continuously, so counting seconds will not give you the distance &mdash; you have to integrate the motion you see.</p>
+      <p><b>Angle</b>: reproduce the turn you were just given. <b>Distance</b>: reproduce the distance you were just moved. <b>Homing</b>: turn until you face where you started. <b>Renav</b>: face the start, then travel back and stop on it &mdash; direction and distance combined, so it is the hardest. Tap a type to include or exclude it; harder ones unlock as the level rises, but your choice always wins.</p>
+      <p><b>Controls.</b> Turn by dragging the view, or with <kbd>&larr;</kbd><kbd>&rarr;</kbd> (<kbd>&uarr;</kbd><kbd>&darr;</kbd> pitch in 3D, <kbd>Q</kbd><kbd>E</kbd> for the fourth axis in 4D). Move forward by holding <b>Hold to move</b>, <kbd>Space</kbd> or <kbd>W</kbd>, and back up with <b>Back</b> or <kbd>S</kbd> if you overshoot. Confirm with <kbd>Enter</kbd>. The line under the buttons always shows what is available right now.</p>
+      <p><b>Path.</b> Passive carries you along a fixed route. Active lets you steer to a series of markers that vanish once reached, so you generate the path yourself &mdash; but the engine still owns your speed, so timing your own key presses never gives you the distance.</p>
+      <p>The staircase is a 2-down/1-up transformed rule (Levitt, 1971): two correct in a row makes it harder, one wrong makes it easier, which holds you at about 71% success. Step size halves at the 2nd, 4th and 6th reversal, and the threshold estimate is the mean of the last six reversals. It adapts legs per path, speed variability, turn spread, acceleration, flow density, dot lifetime and delay &mdash; legs keep growing, so there is no ceiling. Use &minus; and + to move the level yourself and let it carry on from there, pin the world to 2D, 3D or 4D at any time, or switch to Manual to set every parameter by hand.</p>
+      <p><b>The fourth dimension.</b> Where you sit along the fourth axis is shown the way 4D visualisation research does it &mdash; Aflalo and Graziano used a warm/cold colour cue for the extra axis, and early higher-dimensional rendering leaned on colour, texture, shadow and lighting for the same job. Dots ahead of you along w turn amber, dots behind turn blue, level ones stay pale, and 4D perspective shrinks whatever is far along w. The optional w-pulse adds a brightness wave whose phase follows w, so translating along that axis sweeps a ripple through the field; it is off by default, since a flickering display can be mistaken for motion and motion is exactly what this task asks you to read.</p>
+      <p><b>Your data.</b> Everything is stored in this browser on this device. There are no network requests anywhere in this file. Reset session erases it.</p>
+    </details>
+
+    <footer class="credit">Optic-flow path integration after Chrastil's loop paradigm; variable speed targets the velocity-gain error that dominates human path integration.</footer>
+
+  </aside>
+  </div>
+
+  <div class="scroll-cue" id="scrollCue"><b>&darr;</b> more settings below</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ============ constants ============
+  var NEAR = 0.6, FAR = 46, FOCAL = 0.9, CAM_H = 1.35;
+  var W_SLAB = 7.5;                      // how far along the 4th axis stays visible
+  var TURN_MS = 900;
+  var CRIT = 0.62;                       // score at or above this counts as correct
+  var STEP0 = 2.0, STEP_FLOOR = 0.35;    // staircase step, in levels
+  var REV_HALVE = [2, 4, 6];             // halve the step at these reversal counts
+  var THR_WINDOW = 6;                    // reversals averaged for the threshold estimate
+  var SC_RULE = 2;                       // 2-down/1-up -> holds 0.5^(1/2) = 70.7% success
+  // task pool: harder types unlock as the level rises, and are then sampled more often
+  var TASK_META = {
+    angle:    { label: 'Angle',    minLevel: 1,  weight: 1 },
+    distance: { label: 'Distance', minLevel: 1,  weight: 1 },
+    homing:   { label: 'Homing',   minLevel: 3,  weight: 2 },
+    'return': { label: 'Renav',    minLevel: 6,  weight: 3 }
+  };
+  var HIST_MAX = 24;
+  var MODES = ['homing', 'return', 'distance', 'angle'];
+
+  // ============ local-only storage ============
+  // Everything stays on this device. No network calls anywhere in this file.
+  // If the browser blocks storage, the app silently falls back to memory.
+  var Store = (function(){
+    var mem = {}, ok = false;
+    try {
+      var probe = '__pi_probe';
+      window.localStorage.setItem(probe, '1');
+      window.localStorage.removeItem(probe);
+      ok = true;
+    } catch (e) { ok = false; }
+    return {
+      persistent: ok,
+      get: function(k){ try { return ok ? window.localStorage.getItem(k) : (mem[k] || null); } catch (e) { return null; } },
+      set: function(k, v){ try { if (ok) window.localStorage.setItem(k, v); else mem[k] = v; } catch (e) {} },
+      del: function(k){ try { if (ok) window.localStorage.removeItem(k); else delete mem[k]; } catch (e) {} }
+    };
+  })();
+  var SAVE_KEY = 'deadreckoning.v1';
+
+  // ============ vector helpers (n-dimensional) ============
+  function vZero(n){ var a = []; for (var i=0;i<n;i++) a.push(0); return a; }
+  function vAxis(n, k){ var a = vZero(n); a[k] = 1; return a; }
+  function vAdd(a, b){ var r=[]; for (var i=0;i<a.length;i++) r.push(a[i]+b[i]); return r; }
+  function vSub(a, b){ var r=[]; for (var i=0;i<a.length;i++) r.push(a[i]-b[i]); return r; }
+  function vScale(a, s){ var r=[]; for (var i=0;i<a.length;i++) r.push(a[i]*s); return r; }
+  function vDot(a, b){ var s=0; for (var i=0;i<a.length;i++) s+=a[i]*b[i]; return s; }
+  function vLen(a){ return Math.sqrt(vDot(a,a)); }
+  function vNorm(a){ var l=vLen(a); return l>1e-9 ? vScale(a,1/l) : a.slice(); }
+  function clamp(v,lo,hi){ return Math.min(hi, Math.max(lo, v)); }
+  function wColour(t){
+    // t in [-1,1]: behind you along w = cold blue, ahead = warm amber, level = neutral
+    var cold = [70, 150, 255], mid = [190, 220, 208], warm = [255, 150, 38];
+    var a = t < 0 ? cold : warm, k = Math.abs(t);
+    return 'rgb(' + Math.round(mid[0] + (a[0]-mid[0])*k) + ',' +
+                    Math.round(mid[1] + (a[1]-mid[1])*k) + ',' +
+                    Math.round(mid[2] + (a[2]-mid[2])*k) + ')';
+  }
+  function randRange(lo,hi){ return lo + Math.random()*(hi-lo); }
+
+  function identityBasis(n){ var b=[]; for (var i=0;i<n;i++) b.push(vAxis(n,i)); return b; }
+  function rotateBasis(basis, i, j, ang){
+    var c=Math.cos(ang), s=Math.sin(ang), bi=basis[i], bj=basis[j], ni=[], nj=[];
+    for (var k=0;k<bi.length;k++){ ni.push(c*bi[k] + s*bj[k]); nj.push(-s*bi[k] + c*bj[k]); }
+    basis[i]=ni; basis[j]=nj;
+  }
+  function orthonormalize(basis){
+    for (var i=0;i<basis.length;i++){
+      var v = basis[i].slice();
+      for (var j=0;j<i;j++){ var d = vDot(v, basis[j]); v = vSub(v, vScale(basis[j], d)); }
+      basis[i] = vNorm(v);
+    }
+  }
+
+  // ============ dom ============
+  var stage = document.getElementById('stage');
+  var canvas = document.getElementById('view');
+  var ctx = canvas.getContext('2d');
+  var overlay = document.getElementById('overlay');
+  var modeTag = document.getElementById('modeTag');
+  var dimTag = document.getElementById('dimTag');
+  var phaseLabel = document.getElementById('phaseLabel');
+  var rightStatus = document.getElementById('rightStatus');
+  var mainBtn = document.getElementById('mainBtn');
+  var moveBtn = document.getElementById('moveBtn');
+  var backBtn = document.getElementById('backBtn');
+  var keyhint = document.getElementById('keyhint');
+  var auxRow = document.getElementById('auxRow');
+  var anaMinus = document.getElementById('anaMinus');
+  var anaPlus = document.getElementById('anaPlus');
+  var feedbackEl = document.getElementById('feedback');
+  var levelBadge = document.getElementById('levelBadge');
+  var streakVal = document.getElementById('streakVal');
+  var bestVal = document.getElementById('bestVal');
+  var avgVal = document.getElementById('avgVal');
+  var trialsVal = document.getElementById('trialsVal');
+  var sparkLine = document.getElementById('sparkLine');
+  var taskChips = document.getElementById('taskChips');
+  var poolInfo = document.getElementById('poolInfo');
+  var dimSeg = document.getElementById('dimSeg');
+  var levelRow = document.getElementById('levelRow');
+  var levelSetVal = document.getElementById('levelSetVal');
+  var levelDown = document.getElementById('levelDown');
+  var levelUp = document.getElementById('levelUp');
+  var summaryEl = document.getElementById('summary');
+  var storageNote = document.getElementById('storageNote');
+  var cueSeg = document.getElementById('cueSeg');
+  var cueLabel = document.getElementById('cueLabel');
+  var wLegend = document.getElementById('wLegend');
+  var turnReadout = document.getElementById('turnReadout');
+  var accelReadout = document.getElementById('accelReadout');
+  var accelSlider = document.getElementById('accelSlider'), accelOut = document.getElementById('accelOut');
+  var turnSlider = document.getElementById('turnSlider'), turnOut = document.getElementById('turnOut');
+  var adaptSeg = document.getElementById('adaptSeg');
+  var pathSeg = document.getElementById('pathSeg');
+  var stairInfo = document.getElementById('stairInfo');
+  var audioSeg = document.getElementById('audioSeg');
+  var readoutGroup = document.getElementById('readoutGroup');
+  var sliderGroup = document.getElementById('sliderGroup');
+  var segReadout = document.getElementById('segReadout');
+  var jitReadout = document.getElementById('jitReadout');
+  var flowReadout = document.getElementById('flowReadout');
+  var delayReadout = document.getElementById('delayReadout');
+  var dimSlider = document.getElementById('dimSlider'), dimOut = document.getElementById('dimOut');
+  var segSlider = document.getElementById('segSlider'), segOut = document.getElementById('segOut');
+  var jitSlider = document.getElementById('jitSlider'), jitOut = document.getElementById('jitOut');
+  var flowSlider = document.getElementById('flowSlider'), flowOut = document.getElementById('flowOut');
+  var lifeSlider = document.getElementById('lifeSlider'), lifeOut = document.getElementById('lifeOut');
+  var delaySlider = document.getElementById('delaySlider'), delayOut = document.getElementById('delayOut');
+  var resetBtn = document.getElementById('resetBtn');
+
+  // ============ state ============
+  var level = 1, adaptMode = 'auto', audioOn = false, pathMode = 'passive';
+  var enabledTasks = { angle: true, distance: true, homing: true, 'return': true };
+  var dimPin = 0;                        // 0 = follow the level, else 2 / 3 / 4
+  var pulse4d = false;
+  var taskStats = {};                    // per-task { n, sum, correct }
+  MODES.forEach(function(m){ taskStats[m] = { n: 0, sum: 0, correct: 0 }; });
+  var P = deriveParams(1);
+  var trialMode = 'homing';
+
+  var dims = 2;
+  var pos = vZero(2), basis = identityBasis(2);
+  var dots = [];
+  var phase = 'ready';          // ready | travel | delay | respond | feedback
+  var plan = null;              // travel plan
+  var planIdx = 0, planT = 0;
+  var curSpeed = 0;
+  var travelledThisResponse = 0, pathDist = 0;
+  var activeTargets = [], activeIdx = 0, activeT = 0;
+  var responseTurn = 0;         // for angle mode, cumulative yaw during response
+  var lockedHeading = null;     // for return mode
+  var returnStage = 0;          // 0 = aiming, 1 = travelling
+  var moving = false, moveDir = 0, nowT = 0;
+  var lastTs = 0, rafId = null;
+  var delayUntil = 0;
+  var truth = null;             // { homeDir:[], homeDist, legDist, turnAngle }
+  var lastResult = null;
+
+  var history = [], trials = 0, streak = 0, best = 0;
+  var levelF = 1.0;                      // continuous level; `level` is its display integer
+  var scRun = 0, scLastDir = 0, scStep = STEP0, scReversals = [];
+  var levelTrace = [];
+
+  // ============ audio ============
+  var actx = null, osc = null, gainNode = null;
+  function ensureAudio(){
+    if (!audioOn) return;
+    if (!actx) {
+      try {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        actx = new AC();
+        osc = actx.createOscillator();
+        gainNode = actx.createGain();
+        gainNode.gain.value = 0;
+        osc.type = 'sine';
+        osc.frequency.value = 200;
+        osc.connect(gainNode); gainNode.connect(actx.destination);
+        osc.start();
+      } catch (e) { actx = null; }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+  function setAudioSpeed(v){
+    if (!actx || !gainNode || !osc) return;
+    var on = audioOn && v > 0.01;
+    gainNode.gain.setTargetAtTime(on ? 0.045 : 0, actx.currentTime, 0.03);
+    if (on) osc.frequency.setTargetAtTime(150 + v * 55, actx.currentTime, 0.03);
+  }
+  function stopAudio(){ if (gainNode && actx) gainNode.gain.setTargetAtTime(0, actx.currentTime, 0.05); }
+
+  // ============ params ============
+  function deriveParams(L){
+    return {
+      dims: dimPin ? dimPin : (L < 9 ? 2 : (L < 18 ? 3 : 4)),
+      legs: 2 + Math.floor((L - 1) / 4),            // unbounded
+      jitter: clamp(0.45 + 0.055 * (L - 1), 0.45, 0.92),
+      accel: clamp(0.6 + 0.085 * (L - 1), 0.6, 2.8),  // how abruptly speed changes
+      turnHi: clamp(1.3 + 0.10 * (L - 1), 1.3, 3.05), // widest turn, radians
+      flow: Math.round(clamp(220 - 8 * (L - 1), 25, 220)),
+      life: clamp(2.5 - 0.11 * (L - 1), 0.35, 2.5), // seconds
+      delay: clamp(180 * (L - 1), 0, 6000)
+    };
+  }
+  function paramsFromSliders(){
+    return {
+      dims: dimPin ? dimPin : Number(dimSlider.value),
+      legs: Number(segSlider.value),
+      jitter: Number(jitSlider.value) / 100,
+      accel: Number(accelSlider.value) / 100,
+      turnHi: Number(turnSlider.value) / 100,
+      flow: Number(flowSlider.value),
+      life: Number(lifeSlider.value) / 10,
+      delay: Number(delaySlider.value)
+    };
+  }
+  function syncSliderOutputs(){
+    dimOut.textContent = dimSlider.value + 'D';
+    accelOut.textContent = (Number(accelSlider.value)/100).toFixed(2);
+    turnOut.textContent = (Number(turnSlider.value)/100).toFixed(2) + ' rad';
+    segOut.textContent = segSlider.value;
+    jitOut.textContent = jitSlider.value + '%';
+    flowOut.textContent = flowSlider.value;
+    lifeOut.textContent = (Number(lifeSlider.value) / 10).toFixed(1) + 's';
+    delayOut.textContent = (Number(delaySlider.value) / 1000).toFixed(1) + 's';
+  }
+  function syncReadouts(){
+    segReadout.textContent = String(P.legs);
+    jitReadout.textContent = Math.round(P.jitter * 100) + '%';
+    turnReadout.textContent = (P.turnHi || 0).toFixed(2);
+    accelReadout.textContent = (P.accel || 0).toFixed(2);
+    flowReadout.textContent = String(P.flow);
+    delayReadout.textContent = (P.delay / 1000).toFixed(1) + 's';
+  }
+
+  // ============ canvas ============
+  function resizeCanvas(){
+    var r = stage.getBoundingClientRect();
+    var dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(r.width * dpr));
+    canvas.height = Math.max(1, Math.round(r.height * dpr));
+  }
+  var scrollCue = document.getElementById('scrollCue');
+  function updateScrollCue(){
+    var doc = document.documentElement;
+    var more = (doc.scrollHeight - window.innerHeight - window.scrollY) > 40;
+    scrollCue.classList.toggle('show', more);
+  }
+  window.addEventListener('scroll', updateScrollCue, { passive: true });
+  window.addEventListener('resize', function(){ resizeCanvas(); render(); updateScrollCue(); });
+  if (window.ResizeObserver) {
+    try {
+      new ResizeObserver(function(){ resizeCanvas(); render(); }).observe(stage);
+    } catch (e) {}
+  }
+
+  // ============ dot field ============
+  function spawnDot(ahead){
+    // spawn inside the view frustum: lateral spread grows with depth so
+    // angular density stays even and near dots don't fly off-screen instantly
+    var lo = ahead ? NEAR + 5 : NEAR + 0.5;
+    // bias toward the near field: close dots carry most of the speed signal
+    // and, on a ground plane, spread vertically instead of piling on the horizon
+    var f = lo + (FAR - lo) * Math.pow(Math.random(), 2.1);
+    var d = vScale(basis[0], f);
+    d = vAdd(d, vScale(basis[1], randRange(-1, 1) * f * 0.55));
+    if (dims >= 3) {
+      // match the real vertical half-angle of the canvas so nothing spawns off-screen
+      var vSpread = 0.5 * (canvas.height / Math.max(1, canvas.width)) / FOCAL;
+      d = vAdd(d, vScale(basis[2], randRange(-1, 1) * f * vSpread));
+      if (dims >= 4) d = vAdd(d, vScale(basis[3], randRange(-W_SLAB, W_SLAB)));
+    }
+    return { p: vAdd(pos, d), life: randRange(0.3, 1) * P.life };
+  }
+  function seedDots(){
+    dots = [];
+    for (var i = 0; i < P.flow; i++) dots.push(spawnDot(false));
+  }
+  function refreshDots(dt){
+    if (dots.length !== P.flow) {
+      while (dots.length < P.flow) dots.push(spawnDot(true));
+      if (dots.length > P.flow) dots.length = P.flow;
+    }
+    for (var i = 0; i < dots.length; i++) {
+      var d = dots[i];
+      d.life -= dt;
+      var rel = vSub(d.p, pos);
+      var f = vDot(rel, basis[0]);
+      if (d.life <= 0 || f < NEAR || f > FAR + 6) dots[i] = spawnDot(true);
+    }
+  }
+
+  function render(){
+    var W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#050807';
+    ctx.fillRect(0, 0, W, H);
+
+    var cx = W / 2, cy = (dims === 2 ? H * 0.34 : H * 0.5), scale = W * FOCAL;
+
+    for (var i = 0; i < dots.length; i++) {
+      var rel = vSub(dots[i].p, pos);
+      var f = vDot(rel, basis[0]);
+      if (f < NEAR) continue;
+      var r = vDot(rel, basis[1]);
+      var sx = cx + scale * r / f, sy;
+      var alpha = 1;
+
+      var wSigned = 0;
+      if (dims === 2) {
+        sy = cy + scale * CAM_H / f;
+      } else {
+        var u = vDot(rel, basis[2]);
+        sy = cy - scale * u / f;
+        if (dims >= 4) {
+          wSigned = vDot(rel, basis[3]);
+          alpha = clamp(1 - 0.72 * Math.abs(wSigned) / W_SLAB, 0, 1);
+          if (alpha <= 0.02) continue;
+        }
+      }
+      if (sx < -40 || sx > W + 40 || sy < -40 || sy > H + 40) continue;
+
+      var fade = clamp(1 - (f - NEAR) / (FAR - NEAR), 0, 1);
+      var lifeFade = clamp(dots[i].life / 0.35, 0, 1);
+      var rad = Math.max(0.7, (W / 620) * (2.4 * fade + 0.5));
+      var bright = 1;
+      var col = '#B9D8CC';
+
+      if (dims >= 4) {
+        // Aflalo & Graziano used a warm/cold colour cue for the fourth axis;
+        // 4D perspective additionally shrinks whatever is far along w.
+        var t4 = clamp(wSigned / W_SLAB, -1, 1);
+        col = wColour(t4);
+        rad *= (1 - 0.42 * Math.abs(t4));
+        if (pulse4d) {
+          // phase locked to w, so translating along w sweeps a visible wave
+          // through the field instead of flashing everything at once
+          bright = 1 + 0.3 * Math.sin(nowT * 2.6 - wSigned * 0.85);
+        }
+      }
+
+      ctx.globalAlpha = clamp((0.16 + 0.72 * fade * alpha * lifeFade) * bright, 0, 1);
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(sx, sy, Math.max(0.6, rad), 0, 6.2832);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // crosshair — the only fixed reference, marks straight ahead
+    var showCross = (phase === 'respond' || phase === 'feedback');
+    if (showCross) {
+      ctx.strokeStyle = 'rgba(127,227,180,0.75)';
+      ctx.lineWidth = Math.max(1, W / 500);
+      var s = W / 42;
+      ctx.beginPath();
+      ctx.moveTo(cx - s, cy); ctx.lineTo(cx - s * 0.3, cy);
+      ctx.moveTo(cx + s * 0.3, cy); ctx.lineTo(cx + s, cy);
+      ctx.moveTo(cx, cy - s); ctx.lineTo(cx, cy - s * 0.3);
+      ctx.moveTo(cx, cy + s * 0.3); ctx.lineTo(cx, cy + s);
+      ctx.stroke();
+    }
+
+    // current active-travel marker
+    if (phase === 'travel' && isActiveTrial() && activeIdx < activeTargets.length) {
+      var mrel = vSub(activeTargets[activeIdx], pos);
+      var mf = vDot(mrel, basis[0]);
+      var mr = vDot(mrel, basis[1]);
+      var onScreen = false, mx = 0, my = 0;
+      var slabOk = !(dims >= 4 && Math.abs(vDot(mrel, basis[3])) > W_SLAB * 1.2);
+      if (mf > NEAR) {
+        mx = cx + scale * mr / mf;
+        my = (dims === 2) ? cy + scale * CAM_H / mf : cy - scale * vDot(mrel, basis[2]) / mf;
+        onScreen = slabOk && mx > 4 && mx < W - 4 && my > 4 && my < H - 4;
+      }
+      if (onScreen) {
+        var rr = clamp(scale * 1.5 / mf, W / 90, W / 9);
+        var mCol = 'rgba(242,166,90,0.95)';
+        if (dims >= 4) {
+          var mt = clamp(vDot(mrel, basis[3]) / W_SLAB, -1, 1);
+          mCol = wColour(mt);
+          rr *= (1 - 0.42 * Math.abs(mt));
+          // a dashed ring means the marker is off your current w-slice
+          ctx.setLineDash(Math.abs(mt) > 0.18 ? [W/70, W/70] : []);
+        }
+        ctx.strokeStyle = mCol;
+        ctx.lineWidth = Math.max(1.2, W / 300);
+        ctx.beginPath(); ctx.arc(mx, my, Math.max(2, rr), 0, 6.2832); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = mCol;
+        ctx.beginPath(); ctx.arc(mx, my, Math.max(1.4, rr * 0.16), 0, 6.2832); ctx.fill();
+      } else {
+        // off screen or behind: point the way to turn, at the edge it lies on
+        var side = mr >= 0 ? 1 : -1;
+        var ex = side > 0 ? W * 0.93 : W * 0.07;
+        ctx.fillStyle = 'rgba(242,166,90,0.92)';
+        ctx.font = '600 ' + (W / 20) + 'px monospace';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(side > 0 ? '\u203A' : '\u2039', ex, cy);
+        ctx.font = (W / 46) + 'px monospace';
+        ctx.fillText('turn', ex, cy + W / 22);
+        ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
+      }
+    }
+
+    // feedback: where home actually was
+    if (phase === 'feedback' && truth && lastResult && lastResult.showArrow) {
+      var hd = truth.homeDir;
+      var hf = vDot(hd, basis[0]), hr = vDot(hd, basis[1]);
+      var hx, hy;
+      if (hf > 0.08) {
+        hx = cx + scale * (hr / hf) * 0.35;
+        hy = dims === 2 ? cy : cy - scale * (vDot(hd, basis[2]) / hf) * 0.35;
+      } else {
+        hx = cx + (hr >= 0 ? W * 0.42 : -W * 0.42);
+        hy = cy;
+      }
+      hx = clamp(hx, W * 0.06, W * 0.94); hy = clamp(hy, H * 0.06, H * 0.94);
+      ctx.strokeStyle = 'rgba(242,166,90,0.95)';
+      ctx.fillStyle = 'rgba(242,166,90,0.95)';
+      ctx.lineWidth = Math.max(1, W / 460);
+      ctx.beginPath(); ctx.arc(hx, hy, W / 55, 0, 6.2832); ctx.stroke();
+      ctx.beginPath(); ctx.arc(hx, hy, W / 200, 0, 6.2832); ctx.fill();
+    }
+  }
+
+  // ============ path plan ============
+  // A leg is defined by a DURATION and a SPEED PROFILE, never by a distance.
+  // Distance emerges from integrating the profile, so elapsed time is not a
+  // usable proxy for how far you went — the whole point of the task.
+  function makeLeg(planeJ, ang, still){
+    var spread = P.jitter;
+    return {
+      j: planeJ,
+      ang: ang,
+      dur: still ? 0 : randRange(1.3, 3.4),
+      meanSpeed: still ? 0 : 6.5 * (1 + randRange(-1, 1) * spread * 0.85),
+      f1: randRange(0.35, 0.9) * P.accel, f2: randRange(0.9, 1.9) * P.accel,
+      ph1: Math.random() * 6.2832, ph2: Math.random() * 6.2832
+    };
+  }
+  function legSpeed(leg, t){
+    if (leg.dur <= 0) return 0;
+    var u = clamp(t / leg.dur, 0, 1);
+    var wobble = (Math.sin(6.2832 * leg.f1 * t + leg.ph1) + 0.6 * Math.sin(6.2832 * leg.f2 * t + leg.ph2)) / 1.6;
+    var env = clamp(Math.min(u, 1 - u) / 0.16, 0, 1);   // smooth start and stop
+    var s = leg.meanSpeed * (1 + P.jitter * 0.6 * wobble) * (0.25 + 0.75 * env);
+    return Math.max(0, s);
+  }
+  function buildPlan(){
+    var legs = P.legs, steps = [], i;
+    for (i = 0; i < legs; i++) {
+      var planeJ = 1;
+      if (dims >= 3 && Math.random() < 0.4) planeJ = 2;
+      if (dims >= 4 && Math.random() < 0.25) planeJ = 3;
+      var ang = (Math.random() < 0.5 ? -1 : 1) * randRange(0.35, P.turnHi);
+      if (i === 0) ang *= 0.35;
+      steps.push(makeLeg(planeJ, ang, false));
+    }
+    return steps;
+  }
+
+  function startTrial(){
+    trialMode = pickTask();
+    dims = P.dims;
+    pos = vZero(dims); basis = identityBasis(dims);
+    activeTargets = []; activeIdx = 0; activeT = 0;
+    if (isActiveTrial()) { plan = null; buildActiveTargets(); }
+    else plan = (trialMode === 'angle' || trialMode === 'distance') ? buildSimplePlan() : buildPlan();
+    planIdx = 0; planT = 0;
+    travelledThisResponse = 0; pathDist = 0; responseTurn = 0; lockedHeading = null; returnStage = 0;
+    curSpeed = 0; moving = false; moveDir = 0;
+    truth = null; lastResult = null;
+    seedDots();
+    setPhase('ready');
+    modeTag.textContent = trialMode.toUpperCase();
+    dimTag.textContent = dims + 'D';
+    var is4 = dims >= 4;
+    wLegend.classList.toggle('hidden', !is4);
+    cueSeg.classList.toggle('hidden', !is4);
+    cueLabel.classList.toggle('hidden', !is4);
+    overlay.innerHTML = '<span>Press <b>Travel</b> to begin.</span>';
+    mainBtn.textContent = 'Travel';
+    mainBtn.disabled = false;
+    refreshControls();
+    render();
+  }
+  function buildSimplePlan(){
+    if (trialMode === 'angle') return [makeLeg(1, (Math.random()<0.5?-1:1)*randRange(0.5, Math.max(1.0, P.turnHi)), true)];
+    return [makeLeg(1, 0, false)];
+  }
+
+  function setPhase(p){
+    phase = p;
+    phaseLabel.textContent = p.toUpperCase();
+    auxRow.classList.toggle('hidden', !(p === 'respond' && dims >= 4 && (trialMode === 'homing' || trialMode === 'return')));
+    refreshControls();
+  }
+
+  // ============ travel ============
+  function beginTravel(){
+    ensureAudio();
+    setPhase('travel');
+    overlay.textContent = '';
+    mainBtn.disabled = true;
+    if (isActiveTrial()) {
+      rightStatus.textContent = 'marker 1 of ' + activeTargets.length;
+    } else {
+      rightStatus.textContent = 'leg 1 of ' + plan.length;
+    }
+    planIdx = 0; planT = 0;
+    refreshControls();
+    lastTs = 0;
+    if (!rafId) rafId = requestAnimationFrame(loop);
+  }
+
+  var CAPTURE_R = 2.4;
+  function buildActiveTargets(){
+    // Transient markers, one visible at a time: they force real turns and give
+    // motor efference copy, but vanish on capture so they cannot become a map.
+    activeTargets = []; activeIdx = 0; activeT = 0;
+    var n = P.legs, cur = vZero(dims), fwd = vAxis(dims, 0), i;
+    for (i = 0; i < n; i++) {
+      var b = vNorm(fwd.slice());
+      var yaw = (Math.random() < 0.5 ? -1 : 1) * randRange(0.35, P.turnHi);
+      var tmp = identityBasis(dims);
+      tmp[0] = b;
+      orthonormalize(tmp);
+      rotateBasis(tmp, 0, 1, yaw);
+      if (dims >= 3 && Math.random() < 0.35) rotateBasis(tmp, 0, 2, randRange(-0.7, 0.7));
+      if (dims >= 4 && Math.random() < 0.22) rotateBasis(tmp, 0, 3, randRange(-0.7, 0.7));
+      orthonormalize(tmp);
+      var dist = randRange(9, 20);
+      cur = vAdd(cur, vScale(tmp[0], dist));
+      fwd = tmp[0].slice();
+      activeTargets.push(cur.slice());
+    }
+  }
+
+  function stepActiveTravel(dt){
+    activeT += dt;
+    if (moveDir !== 0) {
+      // you choose when and where to go; the engine still owns the speed,
+      // so distance can never be recovered by timing your own key presses
+      var wob = (Math.sin(activeT * 2.1) + 0.6 * Math.sin(activeT * 4.3)) / 1.6;
+      curSpeed = 6.5 * (1 + P.jitter * 0.6 * wob);
+      curSpeed = Math.max(0.8, curSpeed);
+      pos = vAdd(pos, vScale(basis[0], curSpeed * moveDir * dt));
+      pathDist += curSpeed * dt;   // distance travelled, whichever way you went
+    } else curSpeed = 0;
+    setAudioSpeed(curSpeed);
+
+    if (activeIdx < activeTargets.length) {
+      if (vLen(vSub(activeTargets[activeIdx], pos)) < CAPTURE_R) {
+        activeIdx++;
+        rightStatus.textContent = activeIdx < activeTargets.length
+          ? ('marker ' + (activeIdx + 1) + ' of ' + activeTargets.length) : '';
+        if (activeIdx >= activeTargets.length) finishTravel();
+      }
+    }
+  }
+
+  function stepTravel(dt){
+    if (planIdx >= plan.length) { finishTravel(); return; }
+    var leg = plan[planIdx];
+    var turnDur = Math.abs(leg.ang) > 1e-4 ? TURN_MS * (0.45 + Math.abs(leg.ang) / 2.6) : 0;
+    var moveDur = leg.dur * 1000;
+    planT += dt * 1000;
+
+    if (planT <= turnDur) {
+      var frac = turnDur > 0 ? dt * 1000 / turnDur : 0;
+      rotateBasis(basis, 0, leg.j, leg.ang * frac);
+      orthonormalize(basis);
+      curSpeed = 0;
+    } else if (planT <= turnDur + moveDur) {
+      var tIn = (planT - turnDur) / 1000;
+      curSpeed = legSpeed(leg, tIn);
+      pos = vAdd(pos, vScale(basis[0], curSpeed * dt));
+      pathDist += curSpeed * dt;
+    } else {
+      planIdx++; planT = 0; curSpeed = 0;
+      rightStatus.textContent = planIdx < plan.length ? ('leg ' + (planIdx + 1) + ' of ' + plan.length) : '';
+      if (planIdx >= plan.length) finishTravel();
+    }
+    setAudioSpeed(curSpeed);
+  }
+
+  function finishTravel(){
+    stopAudio(); curSpeed = 0;
+    var toHome = vSub(vZero(dims), pos);
+    truth = {
+      homeDir: vNorm(toHome),
+      homeDist: vLen(toHome),
+      legDist: pathDist,
+      turnAngle: plan ? plan[0].ang : 0
+    };
+    if (P.delay > 0) {
+      setPhase('delay');
+      overlay.innerHTML = '<span>hold it\u2026</span>';
+      delayUntil = performance.now() + P.delay;
+      rightStatus.textContent = '';
+    } else beginRespond();
+  }
+
+  // ============ respond ============
+  function beginRespond(){
+    setPhase('respond');
+    overlay.textContent = '';
+    mainBtn.disabled = false;
+    if (trialMode === 'homing') {
+      mainBtn.textContent = 'Confirm heading';
+      rightStatus.textContent = 'turn to face the start';
+    } else if (trialMode === 'return') {
+      returnStage = 0;
+      mainBtn.textContent = 'Lock heading';
+      rightStatus.textContent = 'face the start, then travel back';
+    } else if (trialMode === 'distance') {
+      mainBtn.textContent = 'Confirm distance';
+      rightStatus.textContent = 'hold to move, match the distance';
+    } else {
+      mainBtn.textContent = 'Confirm angle';
+      rightStatus.textContent = 'reproduce the turn';
+    }
+    refreshControls();
+  }
+
+  function stepRespond(dt){
+    if (moveDir !== 0 && canMove()) {
+      var step = 6.5 * moveDir * dt;
+      // reversing can undo an overshoot, but never past the point you set out from
+      if (trialMode === 'distance' && travelledThisResponse + step < 0) step = -travelledThisResponse;
+      pos = vAdd(pos, vScale(basis[0], step));
+      travelledThisResponse += step;
+      curSpeed = Math.abs(step) / Math.max(dt, 1e-4);
+    } else curSpeed = 0;
+    setAudioSpeed(curSpeed);
+  }
+
+  function submit(){
+    if (trialMode === 'return' && returnStage === 0) {
+      returnStage = 1;
+      lockedHeading = basis[0].slice();
+      mainBtn.textContent = 'Confirm arrival';
+      rightStatus.textContent = 'hold to travel back';
+      refreshControls();
+      return;
+    }
+    var score = 0, detail = '', showArrow = false;
+
+    if (trialMode === 'homing') {
+      var cosang = clamp(vDot(vNorm(basis[0]), truth.homeDir), -1, 1);
+      var errDeg = Math.acos(cosang) * 180 / Math.PI;
+      score = clamp(1 - errDeg / 90, 0, 1);
+      detail = 'off by ' + errDeg.toFixed(1) + '&deg;';
+      showArrow = true;
+    } else if (trialMode === 'return') {
+      var finalDist = vLen(pos);
+      var rel = finalDist / Math.max... (22 KB left)
