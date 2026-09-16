@@ -56,6 +56,7 @@
             padding: 22px 22px 20px;
         }
 
+        /* one column by default; two on a monitor, with the stage held in view */
         .shell {
             width: 100%;
             max-width: 480px;
@@ -81,6 +82,11 @@
                 top: 24px;
                 max-height: calc(100vh - 48px);
                 overflow: visible;
+            }
+
+            /* the page itself scrolls: one familiar scrollbar, no nested scroll area.
+       the stage stays pinned in view while the settings move past it. */
+            .col-left {
                 align-self: start;
             }
 
@@ -96,6 +102,7 @@
             }
         }
 
+        /* visible, themed scrollbars rather than the OS default overlay */
         .col-right::-webkit-scrollbar,
         body::-webkit-scrollbar {
             width: 11px;
@@ -175,11 +182,6 @@
             overflow: hidden;
             margin-bottom: 10px;
             touch-action: none;
-            cursor: grab;
-        }
-
-        .stage:active {
-            cursor: grabbing;
         }
 
         canvas#view {
@@ -790,12 +792,12 @@
                     <h1>Dead reckoning</h1>
                     <p class="subtitle">Track where you started, using only the motion you see.</p>
                 </div>
-                <div class="level-badge">LEVEL<b id="levelBadge">1.0</b></div>
+                <div class="level-badge">LEVEL<b id="levelBadge">1</b></div>
             </header>
 
             <div class="stage" id="stage">
                 <canvas id="view"></canvas>
-                <div class="mode-tag" id="modeTag">ANGLE</div>
+                <div class="mode-tag" id="modeTag">HOMING</div>
                 <div class="dim-tag" id="dimTag">2D</div>
                 <div class="w-legend hidden" id="wLegend"><i class="cold"></i>behind w<i class="mid"></i>level<i
                         class="warm"></i>ahead w</div>
@@ -813,7 +815,7 @@
                 <button id="mainBtn" class="primary">Travel</button>
             </div>
 
-            <div class="keyhint" id="keyhint">Press Enter or click Travel</div>
+            <div class="keyhint" id="keyhint"></div>
 
             <div class="aux-row hidden" id="auxRow">
                 <button id="anaMinus">&#8722; ana</button>
@@ -831,7 +833,7 @@
 
             <div class="spark-wrap">
                 <svg id="spark" viewBox="0 0 240 32" preserveAspectRatio="none">
-                    <line class="spark-thresh" x1="0" y1="9" x2="240" y2="9"></line>
+                    <line class="spark-thresh" x1="0" y1="8" x2="240" y2="8"></line>
                     <polyline id="sparkLine" class="spark-line" points=""></polyline>
                 </svg>
             </div>
@@ -846,7 +848,7 @@
                 <button data-task="homing" class="on">Homing</button>
                 <button data-task="return" class="on">Renav</button>
             </div>
-            <div class="stair-info" id="poolInfo">Pool: Angle, Distance</div>
+            <div class="stair-info" id="poolInfo"></div>
 
             <div class="seg-label">PATH</div>
             <div class="seg" id="pathSeg">
@@ -873,15 +875,15 @@
                 <div class="level-set"><small>LEVEL</small><b id="levelSetVal">1.0</b></div>
                 <button id="levelUp" aria-label="Raise the level">+</button>
             </div>
-            <div class="stair-info" id="stairInfo">2-down / 1-up Levitt staircase active</div>
+            <div class="stair-info" id="stairInfo"></div>
 
             <div class="readouts" id="readoutGroup">
-                <div><small>Legs</small><span id="segReadout">2</span></div>
-                <div><small>Speed var</small><span id="jitReadout">25%</span></div>
-                <div><small>Turn max</small><span id="turnReadout">0.90 rad</span></div>
-                <div><small>Accel</small><span id="accelReadout">55</span></div>
-                <div><small>Flow</small><span id="flowReadout">135</span></div>
-                <div><small>Delay</small><span id="delayReadout">0.0s</span></div>
+                <div><small>Legs</small><span id="segReadout">&ndash;</span></div>
+                <div><small>Speed var</small><span id="jitReadout">&ndash;</span></div>
+                <div><small>Turn max</small><span id="turnReadout">&ndash;</span></div>
+                <div><small>Accel</small><span id="accelReadout">&ndash;</span></div>
+                <div><small>Flow</small><span id="flowReadout">&ndash;</span></div>
+                <div><small>Delay</small><span id="delayReadout">&ndash;</span></div>
             </div>
 
             <div class="sliders hidden" id="sliderGroup">
@@ -941,7 +943,7 @@
 
             <div class="seg-label">SESSION</div>
             <div class="summary" id="summary"></div>
-            <div class="storage-note" id="storageNote">Progress automatically saved locally.</div>
+            <div class="storage-note" id="storageNote"></div>
 
             <button id="resetBtn">Reset session</button>
 
@@ -996,947 +998,1167 @@
         (function () {
             'use strict';
 
-            // Constants
-            var NEAR = 0.6, FAR = 46, FOCAL = 0.9;
-            var W_SLAB = 7.5;
+            // ============ constants ============
+            var NEAR = 0.6, FAR = 46, FOCAL = 0.9, CAM_H = 1.35;
+            var W_SLAB = 7.5;                      // how far along the 4th axis stays visible
+            var TURN_MS = 900;
+            var CRIT = 0.62;                       // score at or above this counts as correct
+            var STEP0 = 2.0, STEP_FLOOR = 0.35;    // staircase step, in levels
+            var REV_HALVE = [2, 4, 6];             // halve the step at these reversal counts
+            var THR_WINDOW = 6;                    // reversals averaged for the threshold estimate
+            var SC_RULE = 2;                       // 2-down/1-up -> holds 0.5^(1/2) = 70.7% success
+            // task pool: harder types unlock as the level rises, and are then sampled more often
+            var TASK_META = {
+                angle: { label: 'Angle', minLevel: 1, weight: 1 },
+                distance: { label: 'Distance', minLevel: 1, weight: 1 },
+                homing: { label: 'Homing', minLevel: 3, weight: 2 },
+                'return': { label: 'Renav', minLevel: 6, weight: 3 }
+            };
+            var HIST_MAX = 24;
+            var MODES = ['homing', 'return', 'distance', 'angle'];
 
-            // DOM Elements
+            // ============ local-only storage ============
+            // Everything stays on this device. No network calls anywhere in this file.
+            // If the browser blocks storage, the app silently falls back to memory.
+            var Store = (function () {
+                var mem = {}, ok = false;
+                try {
+                    var probe = '__pi_probe';
+                    window.localStorage.setItem(probe, '1');
+                    window.localStorage.removeItem(probe);
+                    ok = true;
+                } catch (e) { ok = false; }
+                return {
+                    persistent: ok,
+                    get: function (k) { try { return ok ? window.localStorage.getItem(k) : (mem[k] || null); } catch (e) { return null; } },
+                    set: function (k, v) { try { if (ok) window.localStorage.setItem(k, v); else mem[k] = v; } catch (e) { } },
+                    del: function (k) { try { if (ok) window.localStorage.removeItem(k); else delete mem[k]; } catch (e) { } }
+                };
+            })();
+            var SAVE_KEY = 'deadreckoning.v1';
+
+            // ============ vector helpers (n-dimensional) ============
+            function vZero(n) { var a = []; for (var i = 0; i < n; i++) a.push(0); return a; }
+            function vAxis(n, k) { var a = vZero(n); a[k] = 1; return a; }
+            function vAdd(a, b) { var r = []; for (var i = 0; i < a.length; i++) r.push(a[i] + b[i]); return r; }
+            function vSub(a, b) { var r = []; for (var i = 0; i < a.length; i++) r.push(a[i] - b[i]); return r; }
+            function vScale(a, s) { var r = []; for (var i = 0; i < a.length; i++) r.push(a[i] * s); return r; }
+            function vDot(a, b) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
+            function vLen(a) { return Math.sqrt(vDot(a, a)); }
+            function vNorm(a) { var l = vLen(a); return l > 1e-9 ? vScale(a, 1 / l) : a.slice(); }
+            function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+            function wColour(t) {
+                // t in [-1,1]: behind you along w = cold blue, ahead = warm amber, level = neutral
+                var cold = [70, 150, 255], mid = [190, 220, 208], warm = [255, 150, 38];
+                var a = t < 0 ? cold : warm, k = Math.abs(t);
+                return 'rgb(' + Math.round(mid[0] + (a[0] - mid[0]) * k) + ',' +
+                    Math.round(mid[1] + (a[1] - mid[1]) * k) + ',' +
+                    Math.round(mid[2] + (a[2] - mid[2]) * k) + ')';
+            }
+            function randRange(lo, hi) { return lo + Math.random() * (hi - lo); }
+
+            function identityBasis(n) { var b = []; for (var i = 0; i < n; i++) b.push(vAxis(n, i)); return b; }
+            function rotateBasis(basis, i, j, ang) {
+                var c = Math.cos(ang), s = Math.sin(ang), bi = basis[i], bj = basis[j], ni = [], nj = [];
+                for (var k = 0; k < bi.length; k++) { ni.push(c * bi[k] + s * bj[k]); nj.push(-s * bi[k] + c * bj[k]); }
+                basis[i] = ni; basis[j] = nj;
+            }
+            function orthonormalize(basis) {
+                for (var i = 0; i < basis.length; i++) {
+                    var v = basis[i].slice();
+                    for (var j = 0; j < i; j++) { var d = vDot(v, basis[j]); v = vSub(v, vScale(basis[j], d)); }
+                    basis[i] = vNorm(v);
+                }
+            }
+
+            // ============ dom ============
+            var stage = document.getElementById('stage');
             var canvas = document.getElementById('view');
             var ctx = canvas.getContext('2d');
-            var stageEl = document.getElementById('stage');
             var overlay = document.getElementById('overlay');
-            var phaseLabel = document.getElementById('phaseLabel');
-            var rightStatus = document.getElementById('rightStatus');
             var modeTag = document.getElementById('modeTag');
             var dimTag = document.getElementById('dimTag');
-            var wLegend = document.getElementById('wLegend');
-            var levelBadge = document.getElementById('levelBadge');
-            var levelSetVal = document.getElementById('levelSetVal');
+            var phaseLabel = document.getElementById('phaseLabel');
+            var rightStatus = document.getElementById('rightStatus');
             var mainBtn = document.getElementById('mainBtn');
             var moveBtn = document.getElementById('moveBtn');
             var backBtn = document.getElementById('backBtn');
+            var keyhint = document.getElementById('keyhint');
             var auxRow = document.getElementById('auxRow');
             var anaMinus = document.getElementById('anaMinus');
             var anaPlus = document.getElementById('anaPlus');
-            var keyhint = document.getElementById('keyhint');
             var feedbackEl = document.getElementById('feedback');
+            var levelBadge = document.getElementById('levelBadge');
             var streakVal = document.getElementById('streakVal');
             var bestVal = document.getElementById('bestVal');
             var avgVal = document.getElementById('avgVal');
             var trialsVal = document.getElementById('trialsVal');
             var sparkLine = document.getElementById('sparkLine');
-            var summaryEl = document.getElementById('summary');
+            var taskChips = document.getElementById('taskChips');
             var poolInfo = document.getElementById('poolInfo');
-            var stairInfo = document.getElementById('stairInfo');
-
-            // Readouts
-            var segReadout = document.getElementById('segReadout');
-            var jitReadout = document.getElementById('jitReadout');
+            var dimSeg = document.getElementById('dimSeg');
+            var levelRow = document.getElementById('levelRow');
+            var levelSetVal = document.getElementById('levelSetVal');
+            var levelDown = document.getElementById('levelDown');
+            var levelUp = document.getElementById('levelUp');
+            var summaryEl = document.getElementById('summary');
+            var storageNote = document.getElementById('storageNote');
+            var cueSeg = document.getElementById('cueSeg');
+            var cueLabel = document.getElementById('cueLabel');
+            var wLegend = document.getElementById('wLegend');
             var turnReadout = document.getElementById('turnReadout');
             var accelReadout = document.getElementById('accelReadout');
+            var accelSlider = document.getElementById('accelSlider'), accelOut = document.getElementById('accelOut');
+            var turnSlider = document.getElementById('turnSlider'), turnOut = document.getElementById('turnOut');
+            var adaptSeg = document.getElementById('adaptSeg');
+            var pathSeg = document.getElementById('pathSeg');
+            var stairInfo = document.getElementById('stairInfo');
+            var audioSeg = document.getElementById('audioSeg');
+            var readoutGroup = document.getElementById('readoutGroup');
+            var sliderGroup = document.getElementById('sliderGroup');
+            var segReadout = document.getElementById('segReadout');
+            var jitReadout = document.getElementById('jitReadout');
             var flowReadout = document.getElementById('flowReadout');
             var delayReadout = document.getElementById('delayReadout');
+            var dimSlider = document.getElementById('dimSlider'), dimOut = document.getElementById('dimOut');
+            var segSlider = document.getElementById('segSlider'), segOut = document.getElementById('segOut');
+            var jitSlider = document.getElementById('jitSlider'), jitOut = document.getElementById('jitOut');
+            var flowSlider = document.getElementById('flowSlider'), flowOut = document.getElementById('flowOut');
+            var lifeSlider = document.getElementById('lifeSlider'), lifeOut = document.getElementById('lifeOut');
+            var delaySlider = document.getElementById('delaySlider'), delayOut = document.getElementById('delayOut');
+            var resetBtn = document.getElementById('resetBtn');
 
-            // Sliders & Groups
-            var sliderGroup = document.getElementById('sliderGroup');
-            var readoutGroup = document.getElementById('readoutGroup');
-            var cueLabel = document.getElementById('cueLabel');
-            var cueSeg = document.getElementById('cueSeg');
+            // ============ state ============
+            var level = 1, adaptMode = 'auto', audioOn = false, pathMode = 'passive';
+            var enabledTasks = { angle: true, distance: true, homing: true, 'return': true };
+            var dimPin = 0;                        // 0 = follow the level, else 2 / 3 / 4
+            var pulse4d = false;
+            var taskStats = {};                    // per-task { n, sum, correct }
+            MODES.forEach(function (m) { taskStats[m] = { n: 0, sum: 0, correct: 0 }; });
+            var P = deriveParams(1);
+            var trialMode = 'homing';
 
-            // Sliders elements
-            var dimSlider = document.getElementById('dimSlider');
-            var segSlider = document.getElementById('segSlider');
-            var jitSlider = document.getElementById('jitSlider');
-            var accelSlider = document.getElementById('accelSlider');
-            var turnSlider = document.getElementById('turnSlider');
-            var flowSlider = document.getElementById('flowSlider');
-            var lifeSlider = document.getElementById('lifeSlider');
-            var delaySlider = document.getElementById('delaySlider');
-
-            var dimOut = document.getElementById('dimOut');
-            var segOut = document.getElementById('segOut');
-            var jitOut = document.getElementById('jitOut');
-            var accelOut = document.getElementById('accelOut');
-            var turnOut = document.getElementById('turnOut');
-            var flowOut = document.getElementById('flowOut');
-            var lifeOut = document.getElementById('lifeOut');
-            var delayOut = document.getElementById('delayOut');
-
-            // App State
-            var state = {
-                phase: 'READY', // READY, TRAVEL, DELAY, REPORT, FEEDBACK
-                task: 'angle', // angle, distance, homing, return
-                userTasks: { angle: true, distance: true, homing: true, return: true },
-                pathType: 'passive', // passive, active
-                dimMode: 0, // 0 = Auto, 2, 3, 4
-                adaptMode: 'auto', // auto, manual
-                level: 1.0,
-                stepSize: 0.5,
-                consecutiveWins: 0,
-                reversals: [],
-                lastDir: 0,
-                cue4D: 'static',
-                audio: 'off',
-                streak: 0,
-                bestStreak: 0,
-                history: []
-            };
-
-            // Dynamics & Camera
-            var cam = { x: 0, y: 0, z: 0, w: 0, yaw: 0, pitch: 0, ana: 0 };
-            var activeActiveDim = 2;
+            var dims = 2;
+            var pos = vZero(2), basis = identityBasis(2);
             var dots = [];
-            var pathLegs = [];
-            var currentLegIdx = 0;
-            var legProgress = 0;
-            var travelStartTime = 0;
-            var travelSpeed = 0;
+            var phase = 'ready';          // ready | travel | delay | respond | feedback
+            var plan = null;              // travel plan
+            var planIdx = 0, planT = 0;
+            var curSpeed = 0;
+            var travelledThisResponse = 0, pathDist = 0;
+            var activeTargets = [], activeIdx = 0, activeT = 0;
+            var responseTurn = 0;         // for angle mode, cumulative yaw during response
+            var lockedHeading = null;     // for return mode
+            var returnStage = 0;          // 0 = aiming, 1 = travelling
+            var moving = false, moveDir = 0, nowT = 0;
+            var lastTs = 0, rafId = null;
+            var delayUntil = 0;
+            var truth = null;             // { homeDir:[], homeDist, legDist, turnAngle }
+            var lastResult = null;
 
-            // Vector Tracking for Task Evaluation
-            var startCam = { x: 0, y: 0, z: 0, w: 0, yaw: 0 };
-            var endCam = { x: 0, y: 0, z: 0, w: 0, yaw: 0 };
-            var givenTurn = 0;
-            var givenDist = 0;
+            var history = [], trials = 0, streak = 0, best = 0;
+            var levelF = 1.0;                      // continuous level; `level` is its display integer
+            var scRun = 0, scLastDir = 0, scStep = STEP0, scReversals = [];
+            var levelTrace = [];
 
-            // Audio Web Context
-            var audioCtx = null;
-            var oscNode = null;
-            var gainNode = null;
+            // ============ audio ============
+            var actx = null, osc = null, gainNode = null;
+            function ensureAudio() {
+                if (!audioOn) return;
+                if (!actx) {
+                    try {
+                        var AC = window.AudioContext || window.webkitAudioContext;
+                        if (!AC) return;
+                        actx = new AC();
+                        osc = actx.createOscillator();
+                        gainNode = actx.createGain();
+                        gainNode.gain.value = 0;
+                        osc.type = 'sine';
+                        osc.frequency.value = 200;
+                        osc.connect(gainNode); gainNode.connect(actx.destination);
+                        osc.start();
+                    } catch (e) { actx = null; }
+                }
+                if (actx && actx.state === 'suspended') actx.resume();
+            }
+            function setAudioSpeed(v) {
+                if (!actx || !gainNode || !osc) return;
+                var on = audioOn && v > 0.01;
+                gainNode.gain.setTargetAtTime(on ? 0.045 : 0, actx.currentTime, 0.03);
+                if (on) osc.frequency.setTargetAtTime(150 + v * 55, actx.currentTime, 0.03);
+            }
+            function stopAudio() { if (gainNode && actx) gainNode.gain.setTargetAtTime(0, actx.currentTime, 0.05); }
 
-            // Input handling states
-            var keys = {};
-            var isMoving = false;
-            var isBacking = false;
-            var isAnaMinus = false;
-            var isAnaPlus = false;
-            var isDragging = false;
-            var dragStart = { x: 0, y: 0 };
+            // ============ params ============
+            function deriveParams(L) {
+                return {
+                    dims: dimPin ? dimPin : (L < 9 ? 2 : (L < 18 ? 3 : 4)),
+                    legs: 2 + Math.floor((L - 1) / 3),            // Slightly faster leg progression
+                    jitter: clamp(0.30 + 0.08 * (L - 1), 0.30, 1.80), // Allows higher speed variability (beyond 100%)
+                    accel: clamp(0.5 + 0.10 * (L - 1), 0.5, 3.5),  // Steeper speed transitions
+                    turnHi: clamp(1.1 + 0.12 * (L - 1), 1.1, 3.14), // Max turn spread
+                    flow: Math.round(clamp(250 - 6 * (L - 1), 30, 250)),
+                    life: clamp(2.8 - 0.10 * (L - 1), 0.3, 2.8),
+                    delay: clamp(150 * (L - 1), 0, 6000),
+                    // NEW: Add a distance multiplier parameter that grows with Level
+                    distMult: 1.0 + 0.15 * (L - 1)
+                };
+            }
+            function paramsFromSliders() {
+                return {
+                    dims: dimPin ? dimPin : Number(dimSlider.value),
+                    legs: Number(segSlider.value),
+                    jitter: Number(jitSlider.value) / 100,
+                    accel: Number(accelSlider.value) / 100,
+                    turnHi: Number(turnSlider.value) / 100,
+                    flow: Number(flowSlider.value),
+                    life: Number(lifeSlider.value) / 10,
+                    delay: Number(delaySlider.value)
+                };
+            }
+            function syncSliderOutputs() {
+                dimOut.textContent = dimSlider.value + 'D';
+                accelOut.textContent = (Number(accelSlider.value) / 100).toFixed(2);
+                turnOut.textContent = (Number(turnSlider.value) / 100).toFixed(2) + ' rad';
+                segOut.textContent = segSlider.value;
+                jitOut.textContent = jitSlider.value + '%';
+                flowOut.textContent = flowSlider.value;
+                lifeOut.textContent = (Number(lifeSlider.value) / 10).toFixed(1) + 's';
+                delayOut.textContent = (Number(delaySlider.value) / 1000).toFixed(1) + 's';
+            }
+            function syncReadouts() {
+                segReadout.textContent = String(P.legs);
+                jitReadout.textContent = Math.round(P.jitter * 100) + '%';
+                turnReadout.textContent = (P.turnHi || 0).toFixed(2);
+                accelReadout.textContent = (P.accel || 0).toFixed(2);
+                flowReadout.textContent = String(P.flow);
+                delayReadout.textContent = (P.delay / 1000).toFixed(1) + 's';
+            }
 
-            // Load saved state
-            function loadSavedData() {
+            // ============ canvas ============
+            function resizeCanvas() {
+                var r = stage.getBoundingClientRect();
+                var dpr = window.devicePixelRatio || 1;
+                canvas.width = Math.max(1, Math.round(r.width * dpr));
+                canvas.height = Math.max(1, Math.round(r.height * dpr));
+            }
+            var scrollCue = document.getElementById('scrollCue');
+            function updateScrollCue() {
+                var doc = document.documentElement;
+                var more = (doc.scrollHeight - window.innerHeight - window.scrollY) > 40;
+                scrollCue.classList.toggle('show', more);
+            }
+            window.addEventListener('scroll', updateScrollCue, { passive: true });
+            window.addEventListener('resize', function () { resizeCanvas(); render(); updateScrollCue(); });
+            if (window.ResizeObserver) {
                 try {
-                    var data = localStorage.getItem('dead_reckoning_data');
-                    if (data) {
-                        var parsed = JSON.parse(data);
-                        if (parsed.history) state.history = parsed.history;
-                        if (parsed.level) state.level = parsed.level;
-                        if (parsed.bestStreak) state.bestStreak = parsed.bestStreak;
-                        if (parsed.streak) state.streak = parsed.streak;
-                    }
+                    new ResizeObserver(function () { resizeCanvas(); render(); }).observe(stage);
                 } catch (e) { }
             }
 
-            function saveData() {
+            // ============ dot field ============
+            function spawnDot(ahead) {
+                // spawn inside the view frustum: lateral spread grows with depth so
+                // angular density stays even and near dots don't fly off-screen instantly
+                var lo = ahead ? NEAR + 5 : NEAR + 0.5;
+                // bias toward the near field: close dots carry most of the speed signal
+                // and, on a ground plane, spread vertically instead of piling on the horizon
+                var f = lo + (FAR - lo) * Math.pow(Math.random(), 2.1);
+                var d = vScale(basis[0], f);
+                d = vAdd(d, vScale(basis[1], randRange(-1, 1) * f * 0.55));
+                if (dims >= 3) {
+                    // match the real vertical half-angle of the canvas so nothing spawns off-screen
+                    var vSpread = 0.5 * (canvas.height / Math.max(1, canvas.width)) / FOCAL;
+                    d = vAdd(d, vScale(basis[2], randRange(-1, 1) * f * vSpread));
+                    if (dims >= 4) d = vAdd(d, vScale(basis[3], randRange(-W_SLAB, W_SLAB)));
+                }
+                return { p: vAdd(pos, d), life: randRange(0.3, 1) * P.life };
+            }
+            function seedDots() {
+                dots = [];
+                for (var i = 0; i < P.flow; i++) dots.push(spawnDot(false));
+            }
+            function refreshDots(dt) {
+                if (dots.length !== P.flow) {
+                    while (dots.length < P.flow) dots.push(spawnDot(true));
+                    if (dots.length > P.flow) dots.length = P.flow;
+                }
+                for (var i = 0; i < dots.length; i++) {
+                    var d = dots[i];
+                    d.life -= dt;
+                    var rel = vSub(d.p, pos);
+                    var f = vDot(rel, basis[0]);
+                    if (d.life <= 0 || f < NEAR || f > FAR + 6) dots[i] = spawnDot(true);
+                }
+            }
+
+            function render() {
+                var W = canvas.width, H = canvas.height;
+                ctx.clearRect(0, 0, W, H);
+                ctx.fillStyle = '#050807';
+                ctx.fillRect(0, 0, W, H);
+
+                var cx = W / 2, cy = (dims === 2 ? H * 0.34 : H * 0.5), scale = W * FOCAL;
+
+                for (var i = 0; i < dots.length; i++) {
+                    var rel = vSub(dots[i].p, pos);
+                    var f = vDot(rel, basis[0]);
+                    if (f < NEAR) continue;
+                    var r = vDot(rel, basis[1]);
+                    var sx = cx + scale * r / f, sy;
+                    var alpha = 1;
+
+                    var wSigned = 0;
+                    if (dims === 2) {
+                        sy = cy + scale * CAM_H / f;
+                    } else {
+                        var u = vDot(rel, basis[2]);
+                        sy = cy - scale * u / f;
+                        if (dims >= 4) {
+                            wSigned = vDot(rel, basis[3]);
+                            alpha = clamp(1 - 0.72 * Math.abs(wSigned) / W_SLAB, 0, 1);
+                            if (alpha <= 0.02) continue;
+                        }
+                    }
+                    if (sx < -40 || sx > W + 40 || sy < -40 || sy > H + 40) continue;
+
+                    var fade = clamp(1 - (f - NEAR) / (FAR - NEAR), 0, 1);
+                    var lifeFade = clamp(dots[i].life / 0.35, 0, 1);
+                    var rad = Math.max(0.7, (W / 620) * (2.4 * fade + 0.5));
+                    var bright = 1;
+                    var col = '#B9D8CC';
+
+                    if (dims >= 4) {
+                        // Aflalo & Graziano used a warm/cold colour cue for the fourth axis;
+                        // 4D perspective additionally shrinks whatever is far along w.
+                        var t4 = clamp(wSigned / W_SLAB, -1, 1);
+                        col = wColour(t4);
+                        rad *= (1 - 0.42 * Math.abs(t4));
+                        if (pulse4d) {
+                            // phase locked to w, so translating along w sweeps a visible wave
+                            // through the field instead of flashing everything at once
+                            bright = 1 + 0.3 * Math.sin(nowT * 2.6 - wSigned * 0.85);
+                        }
+                    }
+
+                    ctx.globalAlpha = clamp((0.16 + 0.72 * fade * alpha * lifeFade) * bright, 0, 1);
+                    ctx.fillStyle = col;
+                    ctx.beginPath();
+                    ctx.arc(sx, sy, Math.max(0.6, rad), 0, 6.2832);
+                    ctx.fill();
+                }
+                ctx.globalAlpha = 1;
+
+                // crosshair — the only fixed reference, marks straight ahead
+                var showCross = (phase === 'respond' || phase === 'feedback');
+                if (showCross) {
+                    ctx.strokeStyle = 'rgba(127,227,180,0.75)';
+                    ctx.lineWidth = Math.max(1, W / 500);
+                    var s = W / 42;
+                    ctx.beginPath();
+                    ctx.moveTo(cx - s, cy); ctx.lineTo(cx - s * 0.3, cy);
+                    ctx.moveTo(cx + s * 0.3, cy); ctx.lineTo(cx + s, cy);
+                    ctx.moveTo(cx, cy - s); ctx.lineTo(cx, cy - s * 0.3);
+                    ctx.moveTo(cx, cy + s * 0.3); ctx.lineTo(cx, cy + s);
+                    ctx.stroke();
+                }
+
+                // current active-travel marker
+                if (phase === 'travel' && isActiveTrial() && activeIdx < activeTargets.length) {
+                    var mrel = vSub(activeTargets[activeIdx], pos);
+                    var mf = vDot(mrel, basis[0]);
+                    var mr = vDot(mrel, basis[1]);
+                    var onScreen = false, mx = 0, my = 0;
+                    var slabOk = !(dims >= 4 && Math.abs(vDot(mrel, basis[3])) > W_SLAB * 1.2);
+                    if (mf > NEAR) {
+                        mx = cx + scale * mr / mf;
+                        my = (dims === 2) ? cy + scale * CAM_H / mf : cy - scale * vDot(mrel, basis[2]) / mf;
+                        onScreen = slabOk && mx > 4 && mx < W - 4 && my > 4 && my < H - 4;
+                    }
+                    if (onScreen) {
+                        var rr = clamp(scale * 1.5 / mf, W / 90, W / 9);
+                        var mCol = 'rgba(242,166,90,0.95)';
+                        if (dims >= 4) {
+                            var mt = clamp(vDot(mrel, basis[3]) / W_SLAB, -1, 1);
+                            mCol = wColour(mt);
+                            rr *= (1 - 0.42 * Math.abs(mt));
+                            // a dashed ring means the marker is off your current w-slice
+                            ctx.setLineDash(Math.abs(mt) > 0.18 ? [W / 70, W / 70] : []);
+                        }
+                        ctx.strokeStyle = mCol;
+                        ctx.lineWidth = Math.max(1.2, W / 300);
+                        ctx.beginPath(); ctx.arc(mx, my, Math.max(2, rr), 0, 6.2832); ctx.stroke();
+                        ctx.setLineDash([]);
+                        ctx.fillStyle = mCol;
+                        ctx.beginPath(); ctx.arc(mx, my, Math.max(1.4, rr * 0.16), 0, 6.2832); ctx.fill();
+                    } else {
+                        // off screen or behind: point the way to turn, at the edge it lies on
+                        var side = mr >= 0 ? 1 : -1;
+                        var ex = side > 0 ? W * 0.93 : W * 0.07;
+                        ctx.fillStyle = 'rgba(242,166,90,0.92)';
+                        ctx.font = '600 ' + (W / 20) + 'px monospace';
+                        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                        ctx.fillText(side > 0 ? '\u203A' : '\u2039', ex, cy);
+                        ctx.font = (W / 46) + 'px monospace';
+                        ctx.fillText('turn', ex, cy + W / 22);
+                        ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
+                    }
+                }
+
+                // feedback: where home actually was
+                if (phase === 'feedback' && truth && lastResult && lastResult.showArrow) {
+                    var hd = truth.homeDir;
+                    var hf = vDot(hd, basis[0]), hr = vDot(hd, basis[1]);
+                    var hx, hy;
+                    if (hf > 0.08) {
+                        hx = cx + scale * (hr / hf) * 0.35;
+                        hy = dims === 2 ? cy : cy - scale * (vDot(hd, basis[2]) / hf) * 0.35;
+                    } else {
+                        hx = cx + (hr >= 0 ? W * 0.42 : -W * 0.42);
+                        hy = cy;
+                    }
+                    hx = clamp(hx, W * 0.06, W * 0.94); hy = clamp(hy, H * 0.06, H * 0.94);
+                    ctx.strokeStyle = 'rgba(242,166,90,0.95)';
+                    ctx.fillStyle = 'rgba(242,166,90,0.95)';
+                    ctx.lineWidth = Math.max(1, W / 460);
+                    ctx.beginPath(); ctx.arc(hx, hy, W / 55, 0, 6.2832); ctx.stroke();
+                    ctx.beginPath(); ctx.arc(hx, hy, W / 200, 0, 6.2832); ctx.fill();
+                }
+            }
+
+            // ============ path plan ============
+            // A leg is defined by a DURATION and a SPEED PROFILE, never by a distance.
+            // Distance emerges from integrating the profile, so elapsed time is not a
+            // usable proxy for how far you went — the whole point of the task.
+            function makeLeg(planeJ, ang, still) {
+                var spread = P.jitter;
+                // Scale duration using P.distMult so higher levels travel significantly further
+                var baseDur = still ? 0 : randRange(1.5, 3.8) * (P.distMult || 1.0);
+
+                return {
+                    j: planeJ,
+                    ang: ang,
+                    dur: baseDur,
+                    meanSpeed: still ? 0 : 6.5 * (1 + randRange(-1, 1) * spread * 0.85),
+                    f1: randRange(0.35, 0.9) * P.accel, f2: randRange(0.9, 1.9) * P.accel,
+                    ph1: Math.random() * 6.2832, ph2: Math.random() * 6.2832
+                };
+            }
+            function legSpeed(leg, t) {
+                if (leg.dur <= 0) return 0;
+                var u = clamp(t / leg.dur, 0, 1);
+                var wobble = (Math.sin(6.2832 * leg.f1 * t + leg.ph1) + 0.6 * Math.sin(6.2832 * leg.f2 * t + leg.ph2)) / 1.6;
+                var env = clamp(Math.min(u, 1 - u) / 0.16, 0, 1);   // smooth start and stop
+                var s = leg.meanSpeed * (1 + P.jitter * 0.6 * wobble) * (0.25 + 0.75 * env);
+                return Math.max(0, s);
+            }
+            function buildPlan() {
+                var legs = P.legs, steps = [], i;
+                for (i = 0; i < legs; i++) {
+                    var planeJ = 1;
+                    if (dims >= 3 && Math.random() < 0.4) planeJ = 2;
+                    if (dims >= 4 && Math.random() < 0.25) planeJ = 3;
+                    var ang = (Math.random() < 0.5 ? -1 : 1) * randRange(0.35, P.turnHi);
+                    if (i === 0) ang *= 0.35;
+                    steps.push(makeLeg(planeJ, ang, false));
+                }
+                return steps;
+            }
+
+            function startTrial() {
+                trialMode = pickTask();
+                dims = P.dims;
+                pos = vZero(dims); basis = identityBasis(dims);
+                activeTargets = []; activeIdx = 0; activeT = 0;
+                if (isActiveTrial()) { plan = null; buildActiveTargets(); }
+                else plan = (trialMode === 'angle' || trialMode === 'distance') ? buildSimplePlan() : buildPlan();
+                planIdx = 0; planT = 0;
+                travelledThisResponse = 0; pathDist = 0; responseTurn = 0; lockedHeading = null; returnStage = 0;
+                curSpeed = 0; moving = false; moveDir = 0;
+                truth = null; lastResult = null;
+                seedDots();
+                setPhase('ready');
+                modeTag.textContent = trialMode.toUpperCase();
+                dimTag.textContent = dims + 'D';
+                var is4 = dims >= 4;
+                wLegend.classList.toggle('hidden', !is4);
+                cueSeg.classList.toggle('hidden', !is4);
+                cueLabel.classList.toggle('hidden', !is4);
+                overlay.innerHTML = '<span>Press <b>Travel</b> to begin.</span>';
+                mainBtn.textContent = 'Travel';
+                mainBtn.disabled = false;
+                refreshControls();
+                render();
+            }
+            function buildSimplePlan() {
+                if (trialMode === 'angle') return [makeLeg(1, (Math.random() < 0.5 ? -1 : 1) * randRange(0.5, Math.max(1.0, P.turnHi)), true)];
+                return [makeLeg(1, 0, false)];
+            }
+
+            function setPhase(p) {
+                phase = p;
+                phaseLabel.textContent = p.toUpperCase();
+                auxRow.classList.toggle('hidden', !(p === 'respond' && dims >= 4 && (trialMode === 'homing' || trialMode === 'return')));
+                refreshControls();
+            }
+
+            // ============ travel ============
+            function beginTravel() {
+                ensureAudio();
+                setPhase('travel');
+                overlay.textContent = '';
+                mainBtn.disabled = true;
+                if (isActiveTrial()) {
+                    rightStatus.textContent = 'marker 1 of ' + activeTargets.length;
+                } else {
+                    rightStatus.textContent = 'leg 1 of ' + plan.length;
+                }
+                planIdx = 0; planT = 0;
+                refreshControls();
+                lastTs = 0;
+                if (!rafId) rafId = requestAnimationFrame(loop);
+            }
+
+            var CAPTURE_R = 2.4;
+            function buildActiveTargets() {
+                // Transient markers, one visible at a time: they force real turns and give
+                // motor efference copy, but vanish on capture so they cannot become a map.
+                activeTargets = []; activeIdx = 0; activeT = 0;
+                var n = P.legs, cur = vZero(dims), fwd = vAxis(dims, 0), i;
+                for (i = 0; i < n; i++) {
+                    var b = vNorm(fwd.slice());
+                    var yaw = (Math.random() < 0.5 ? -1 : 1) * randRange(0.35, P.turnHi);
+                    var tmp = identityBasis(dims);
+                    tmp[0] = b;
+                    orthonormalize(tmp);
+                    rotateBasis(tmp, 0, 1, yaw);
+                    if (dims >= 3 && Math.random() < 0.35) rotateBasis(tmp, 0, 2, randRange(-0.7, 0.7));
+                    if (dims >= 4 && Math.random() < 0.22) rotateBasis(tmp, 0, 3, randRange(-0.7, 0.7));
+                    orthonormalize(tmp);
+                    var dist = randRange(9, 20);
+                    cur = vAdd(cur, vScale(tmp[0], dist));
+                    fwd = tmp[0].slice();
+                    activeTargets.push(cur.slice());
+                }
+            }
+
+            function stepActiveTravel(dt) {
+                activeT += dt;
+                if (moveDir !== 0) {
+                    // you choose when and where to go; the engine still owns the speed,
+                    // so distance can never be recovered by timing your own key presses
+                    var wob = (Math.sin(activeT * 2.1) + 0.6 * Math.sin(activeT * 4.3)) / 1.6;
+                    curSpeed = 6.5 * (1 + P.jitter * 0.6 * wob);
+                    curSpeed = Math.max(0.8, curSpeed);
+                    pos = vAdd(pos, vScale(basis[0], curSpeed * moveDir * dt));
+                    pathDist += curSpeed * dt;   // distance travelled, whichever way you went
+                } else curSpeed = 0;
+                setAudioSpeed(curSpeed);
+
+                if (activeIdx < activeTargets.length) {
+                    if (vLen(vSub(activeTargets[activeIdx], pos)) < CAPTURE_R) {
+                        activeIdx++;
+                        rightStatus.textContent = activeIdx < activeTargets.length
+                            ? ('marker ' + (activeIdx + 1) + ' of ' + activeTargets.length) : '';
+                        if (activeIdx >= activeTargets.length) finishTravel();
+                    }
+                }
+            }
+
+            function stepTravel(dt) {
+                if (planIdx >= plan.length) { finishTravel(); return; }
+                var leg = plan[planIdx];
+                var turnDur = Math.abs(leg.ang) > 1e-4 ? TURN_MS * (0.45 + Math.abs(leg.ang) / 2.6) : 0;
+                var moveDur = leg.dur * 1000;
+                planT += dt * 1000;
+
+                if (planT <= turnDur) {
+                    var frac = turnDur > 0 ? dt * 1000 / turnDur : 0;
+                    rotateBasis(basis, 0, leg.j, leg.ang * frac);
+                    orthonormalize(basis);
+                    curSpeed = 0;
+                } else if (planT <= turnDur + moveDur) {
+                    var tIn = (planT - turnDur) / 1000;
+                    curSpeed = legSpeed(leg, tIn);
+                    pos = vAdd(pos, vScale(basis[0], curSpeed * dt));
+                    pathDist += curSpeed * dt;
+                } else {
+                    planIdx++; planT = 0; curSpeed = 0;
+                    rightStatus.textContent = planIdx < plan.length ? ('leg ' + (planIdx + 1) + ' of ' + plan.length) : '';
+                    if (planIdx >= plan.length) finishTravel();
+                }
+                setAudioSpeed(curSpeed);
+            }
+
+            function finishTravel() {
+                stopAudio(); curSpeed = 0;
+                var toHome = vSub(vZero(dims), pos);
+                truth = {
+                    homeDir: vNorm(toHome),
+                    homeDist: vLen(toHome),
+                    legDist: pathDist,
+                    turnAngle: plan ? plan[0].ang : 0
+                };
+                if (P.delay > 0) {
+                    setPhase('delay');
+                    overlay.innerHTML = '<span>hold it\u2026</span>';
+                    delayUntil = performance.now() + P.delay;
+                    rightStatus.textContent = '';
+                } else beginRespond();
+            }
+
+            // ============ respond ============
+            function beginRespond() {
+                setPhase('respond');
+                overlay.textContent = '';
+                mainBtn.disabled = false;
+                if (trialMode === 'homing') {
+                    mainBtn.textContent = 'Confirm heading';
+                    rightStatus.textContent = 'turn to face the start';
+                } else if (trialMode === 'return') {
+                    returnStage = 0;
+                    mainBtn.textContent = 'Lock heading';
+                    rightStatus.textContent = 'face the start, then travel back';
+                } else if (trialMode === 'distance') {
+                    mainBtn.textContent = 'Confirm distance';
+                    rightStatus.textContent = 'hold to move, match the distance';
+                } else {
+                    mainBtn.textContent = 'Confirm angle';
+                    rightStatus.textContent = 'reproduce the turn';
+                }
+                refreshControls();
+            }
+
+            function stepRespond(dt) {
+                if (moveDir !== 0 && canMove()) {
+                    var step = 6.5 * moveDir * dt;
+                    // reversing can undo an overshoot, but never past the point you set out from
+                    if (trialMode === 'distance' && travelledThisResponse + step < 0) step = -travelledThisResponse;
+                    pos = vAdd(pos, vScale(basis[0], step));
+                    travelledThisResponse += step;
+                    curSpeed = Math.abs(step) / Math.max(dt, 1e-4);
+                } else curSpeed = 0;
+                setAudioSpeed(curSpeed);
+            }
+
+            function submit() {
+                if (trialMode === 'return' && returnStage === 0) {
+                    returnStage = 1;
+                    lockedHeading = basis[0].slice();
+                    mainBtn.textContent = 'Confirm arrival';
+                    rightStatus.textContent = 'hold to travel back';
+                    refreshControls();
+                    return;
+                }
+                var score = 0, detail = '', showArrow = false;
+
+                if (trialMode === 'homing') {
+                    var cosang = clamp(vDot(vNorm(basis[0]), truth.homeDir), -1, 1);
+                    var errDeg = Math.acos(cosang) * 180 / Math.PI;
+                    score = clamp(1 - errDeg / 90, 0, 1);
+                    detail = 'off by ' + errDeg.toFixed(1) + '&deg;';
+                    showArrow = true;
+                } else if (trialMode === 'return') {
+                    var finalDist = vLen(pos);
+                    var rel = finalDist / Math.max(1, truth.legDist);
+                    score = clamp(1 - rel / 0.55, 0, 1);
+                    detail = 'stopped ' + finalDist.toFixed(1) + ' from start (path ' + truth.legDist.toFixed(0) + ')';
+                    showArrow = true;
+                } else if (trialMode === 'distance') {
+                    var ratio = travelledThisResponse / Math.max(0.01, truth.legDist);
+                    var err = Math.abs(ratio - 1);
+                    score = clamp(1 - err / 0.6, 0, 1);
+                    detail = (ratio * 100).toFixed(0) + '% of the distance';
+                } else {
+                    var target = Math.abs(truth.turnAngle);
+                    var errA = Math.abs(Math.abs(responseTurn) - target) * 180 / Math.PI;
+                    score = clamp(1 - errA / 60, 0, 1);
+                    detail = 'off by ' + errA.toFixed(1) + '&deg;';
+                }
+
+                lastResult = { score: score, showArrow: showArrow };
+                setPhase('feedback');
+                mainBtn.textContent = 'Next trial';
+                rightStatus.textContent = '';
+                record(score, detail);
+            }
+
+            // ============ scoring + adaptive ============
+            function record(score, detail) {
+                trials++;
+                history.push(score);
+                if (history.length > HIST_MAX) history.shift();
+
+                var isCorrect = score >= CRIT;
+                streak = isCorrect ? streak + 1 : 0;
+                best = Math.max(best, streak);
+                var ts = taskStats[trialMode];
+                if (ts) { ts.n++; ts.sum += score; if (isCorrect) ts.correct++; }
+
+                var avg = history.reduce(function (a, b) { return a + b; }, 0) / history.length;
+                avgVal.textContent = (avg * 100).toFixed(0) + '%';
+                trialsVal.textContent = String(trials);
+                streakVal.textContent = String(streak);
+                bestVal.textContent = String(best);
+
+                var tone = isCorrect ? 'good' : (score <= 0.3 ? 'poor' : 'mid');
+                feedbackEl.innerHTML = '<span class="' + tone + '">' + detail + ' &middot; ' + (score * 100).toFixed(0) + '%</span>';
+
+                if (adaptMode === 'auto') {
+                    // Levitt (1971) transformed up-down: SC_RULE correct in a row -> harder,
+                    // one incorrect -> easier. Converges on 0.5^(1/SC_RULE) proportion correct.
+                    var dir = 0;
+                    if (isCorrect) { scRun++; if (scRun >= SC_RULE) { dir = +1; scRun = 0; } }
+                    else { scRun = 0; dir = -1; }
+
+                    if (dir !== 0) {
+                        if (scLastDir !== 0 && dir !== scLastDir) {
+                            scReversals.push(levelF);
+                            if (REV_HALVE.indexOf(scReversals.length) !== -1) scStep = Math.max(STEP_FLOOR, scStep / 2);
+                        }
+                        scLastDir = dir;
+                        levelF = Math.max(1, levelF + dir * scStep);
+                        level = levelF;
+                        P = deriveParams(levelF);
+                        syncReadouts();
+                    }
+                    levelBadge.textContent = levelF.toFixed(1);
+                    levelSetVal.textContent = levelF.toFixed(1);
+                    updateStairReadout();
+                    refreshChips();
+                }
+                levelTrace.push(levelF);
+                if (levelTrace.length > HIST_MAX) levelTrace.shift();
+                drawSpark();
+                renderSummary();
+                persist();
+            }
+
+            var poolWasForced = false;
+            function availableTasks() {
+                var out = [];
+                poolWasForced = false;
+                MODES.forEach(function (m) {
+                    if (!enabledTasks[m]) return;
+                    var meta = TASK_META[m];
+                    // in Manual the user is in charge; in Staircase, harder types unlock with level
+                    if (adaptMode === 'auto' && levelF < meta.minLevel) return;
+                    out.push(m);
+                });
+                if (!out.length) {
+                    // your explicit choice wins over the level gate rather than leaving nothing to do
+                    MODES.forEach(function (m) { if (enabledTasks[m]) out.push(m); });
+                    poolWasForced = out.length > 0;
+                }
+                if (!out.length) out.push('homing');
+                return out;
+            }
+            function pickTask() {
+                var pool = availableTasks(), total = 0, i, w = [];
+                for (i = 0; i < pool.length; i++) { var x = TASK_META[pool[i]].weight; w.push(x); total += x; }
+                var r = Math.random() * total;
+                for (i = 0; i < pool.length; i++) { r -= w[i]; if (r <= 0) return pool[i]; }
+                return pool[pool.length - 1];
+            }
+            function refreshChips() {
+                Array.prototype.forEach.call(taskChips.querySelectorAll('button'), function (b) {
+                    var k = b.getAttribute('data-task'), meta = TASK_META[k];
+                    b.classList.toggle('on', !!enabledTasks[k]);
+                    var lockedOut = (adaptMode === 'auto' && levelF < meta.minLevel);
+                    b.classList.toggle('locked', lockedOut);
+                    b.textContent = meta.label + (lockedOut ? ' \u00b7 L' + meta.minLevel : '');
+                });
+                var pool = availableTasks();
+                var note = '';
+                if (adaptMode === 'auto') {
+                    note = poolWasForced
+                        ? ' &middot; above your level, but you chose them'
+                        : ' &middot; harder types unlock with level';
+                }
+                poolInfo.innerHTML = 'in play: ' + pool.map(function (m) { return TASK_META[m].label; }).join(', ') + note;
+            }
+
+            function persist() {
                 try {
-                    localStorage.setItem('dead_reckoning_data', JSON.stringify({
-                        history: state.history,
-                        level: state.level,
-                        bestStreak: state.bestStreak,
-                        streak: state.streak
+                    Store.set(SAVE_KEY, JSON.stringify({
+                        levelF: levelF, adaptMode: adaptMode, pathMode: pathMode, dimPin: dimPin,
+                        audioOn: audioOn, pulse4d: pulse4d, enabledTasks: enabledTasks, taskStats: taskStats,
+                        trials: trials, best: best, reversals: scReversals.slice(-12), step: scStep
                     }));
                 } catch (e) { }
             }
-
-            // Audio logic
-            function initAudio() {
-                if (!audioCtx) {
-                    var AudioContext = window.AudioContext || window.webkitAudioContext;
-                    if (AudioContext) {
-                        audioCtx = new AudioContext();
-                        oscNode = audioCtx.createOscillator();
-                        gainNode = audioCtx.createGain();
-                        oscNode.type = 'sine';
-                        oscNode.frequency.setValueAtTime(200, audioCtx.currentTime);
-                        gainNode.gain.setValueAtTime(0, audioCtx.currentTime);
-                        oscNode.connect(gainNode);
-                        gainNode.connect(audioCtx.destination);
-                        oscNode.start();
-                    }
-                }
-                if (audioCtx && audioCtx.state === 'suspended') {
-                    audioCtx.resume();
-                }
-            }
-
-            function updateAudio(speed) {
-                if (state.audio !== 'on' || !gainNode || !audioCtx) return;
-                var absSpd = Math.abs(speed);
-                if (absSpd > 0.1) {
-                    var targetFreq = 140 + absSpd * 220;
-                    oscNode.frequency.setTargetAtTime(targetFreq, audioCtx.currentTime, 0.05);
-                    gainNode.gain.setTargetAtTime(0.08, audioCtx.currentTime, 0.05);
-                } else {
-                    gainNode.gain.setTargetAtTime(0, audioCtx.currentTime, 0.05);
-                }
-            }
-
-            function stopAudio() {
-                if (gainNode && audioCtx) {
-                    gainNode.gain.setTargetAtTime(0, audioCtx.currentTime, 0.05);
-                }
-            }
-
-            // Parameters derive from level / sliders
-            function getParams() {
-                if (state.adaptMode === 'manual') {
-                    return {
-                        dim: parseInt(dimSlider.value, 10),
-                        legs: parseInt(segSlider.value, 10),
-                        jitter: parseInt(jitSlider.value, 10) / 100,
-                        accel: parseInt(accelSlider.value, 10) / 100,
-                        turnSpread: parseInt(turnSlider.value, 10) / 100,
-                        flowDensity: parseInt(flowSlider.value, 10),
-                        lifetime: parseInt(lifeSlider.value, 10) / 10,
-                        delay: parseInt(delaySlider.value, 10)
-                    };
-                }
-
-                // Automatic Staircase Scaling
-                var lvl = state.level;
-                var effectiveDim = state.dimMode === 0 ? (lvl >= 3.5 ? 4 : (lvl >= 2.0 ? 3 : 2)) : state.dimMode;
-                return {
-                    dim: effectiveDim,
-                    legs: Math.min(14, Math.max(2, Math.floor(1.5 + lvl * 0.5))),
-                    jitter: Math.min(0.92, 0.20 + lvl * 0.05),
-                    accel: Math.min(2.8, 0.40 + lvl * 0.15),
-                    turnSpread: Math.min(3.05, 0.80 + lvl * 0.12),
-                    flowDensity: Math.min(300, Math.floor(110 + lvl * 25)),
-                    lifetime: Math.max(0.5, 3.5 - lvl * 0.15),
-                    delay: Math.min(6000, Math.floor((lvl - 1) * 200))
-                };
-            }
-
-            // Canvas & Starfield Setup
-            function resizeCanvas() {
-                var dpr = window.devicePixelRatio || 1;
-                var rect = stageEl.getBoundingClientRect();
-                canvas.width = Math.floor(rect.width * dpr);
-                canvas.height = Math.floor(rect.height * dpr);
-                ctx.resetTransform();
-                ctx.scale(dpr, dpr);
-            }
-
-            function initDots(density) {
-                dots = [];
-                for (var i = 0; i < density; i++) {
-                    dots.push(createDot(true));
-                }
-            }
-
-            function createDot(randomZ) {
-                return {
-                    x: (Math.random() - 0.5) * 50,
-                    y: (Math.random() - 0.5) * 35,
-                    z: randomZ ? Math.random() * FAR : FAR,
-                    w: (Math.random() - 0.5) * W_SLAB * 2,
-                    age: Math.random()
-                };
-            }
-
-            // Dot Field Updates & Projection Rendering
-            function updateAndRenderDots(dt, params) {
-                var w = stageEl.clientWidth;
-                var h = stageEl.clientHeight;
-                ctx.clearRect(0, 0, w, h);
-
-                // Check active density
-                while (dots.length < params.flowDensity) dots.push(createDot(false));
-                if (dots.length > params.flowDensity) dots.length = params.flowDensity;
-
-                var cYaw = Math.cos(cam.yaw), sYaw = Math.sin(cam.yaw);
-                var cPit = Math.cos(cam.pitch), sPit = Math.sin(cam.pitch);
-                var cAna = Math.cos(cam.ana), sAna = Math.sin(cam.ana);
-
-                var timeSec = Date.now() * 0.003;
-
-                for (var i = 0; i < dots.length; i++) {
-                    var d = dots[i];
-                    d.age += dt / params.lifetime;
-                    if (d.age >= 1.0) {
-                        dots[i] = createDot(false);
-                        continue;
-                    }
-
-                    // Translate relative to camera
-                    var rx = d.x - cam.x;
-                    var ry = d.y - cam.y;
-                    var rz = d.z - cam.z;
-                    var rw = d.w - cam.w;
-
-                    // 4D Ana/Kata rotation transformation
-                    if (params.dim >= 4) {
-                        var x_ana = rx * cAna - rw * sAna;
-                        var w_ana = rx * sAna + rw * cAna;
-                        rx = x_ana;
-                        rw = w_ana;
-                    }
-
-                    // Yaw rotation
-                    var x_yaw = rx * cYaw - rz * sYaw;
-                    var z_yaw = rx * sYaw + rz * cYaw;
-
-                    // Pitch transformation
-                    var y_pit = ry * cPit - z_yaw * sPit;
-                    var z_pit = ry * sPit + z_yaw * cPit;
-
-                    if (z_pit < NEAR || z_pit > FAR) {
-                        if (z_pit < NEAR) dots[i] = createDot(false);
-                        continue;
-                    }
-
-                    // 4D Scale modifier
-                    var scaleW = 1.0;
-                    if (params.dim >= 4) {
-                        scaleW = 1.0 / (1.0 + Math.abs(rw) / 6.0);
-                    }
-
-                    var focal = Math.min(w, h) * FOCAL * scaleW;
-                    var px = (w / 2) + (x_yaw / z_pit) * focal;
-                    var py = (h / 2) - (y_pit / z_pit) * focal;
-
-                    if (px < -20 || px > w + 20 || py < -20 || py > h + 20) continue;
-
-                    // Compute size & opacity fading
-                    var distAlpha = 1.0 - (z_pit / FAR);
-                    var ageAlpha = Math.sin(d.age * Math.PI);
-                    var alpha = Math.max(0, Math.min(1, distAlpha * ageAlpha));
-                    var radius = Math.max(1, (2.8 / (z_pit * 0.15)) * scaleW);
-
-                    // Color assignment based on Dimension Mode
-                    if (params.dim >= 4) {
-                        var cold = [70, 150, 255];
-                        var mid = [190, 220, 208];
-                        var warm = [255, 150, 38];
-                        var col = mid;
-                        var normW = Math.max(-1, Math.min(1, rw / W_SLAB));
-
-                        if (normW < 0) {
-                            var t = -normW;
-                            col = [
-                                Math.round(mid[0] * (1 - t) + cold[0] * t),
-                                Math.round(mid[1] * (1 - t) + cold[1] * t),
-                                Math.round(mid[2] * (1 - t) + cold[2] * t)
-                            ];
-                        } else {
-                            var t2 = normW;
-                            col = [
-                                Math.round(mid[0] * (1 - t2) + warm[0] * t2),
-                                Math.round(mid[1] * (1 - t2) + warm[1] * t2),
-                                Math.round(mid[2] * (1 - t2) + warm[2] * t2)
-                            ];
-                        }
-
-                        if (state.cue4D === 'pulse') {
-                            var pulse = 0.7 + 0.3 * Math.sin(rw * 1.5 + timeSec);
-                            alpha *= pulse;
-                        }
-
-                        ctx.fillStyle = 'rgba(' + col[0] + ',' + col[1] + ',' + col[2] + ',' + alpha.toFixed(2) + ')';
-                    } else {
-                        ctx.fillStyle = 'rgba(127, 227, 180, ' + (alpha * 0.85).toFixed(2) + ')';
-                    }
-
-                    ctx.beginPath();
-                    ctx.arc(px, py, radius, 0, Math.PI * 2);
-                    ctx.fill();
-                }
-            }
-
-            // Path & Motion Controller
-            function startTrial() {
-                var params = getParams();
-                activeActiveDim = params.dim;
-
-                // Select valid task from allowed pool
-                var allowed = getAvailableTasks();
-                if (allowed.length === 0) allowed = ['angle'];
-                state.task = allowed[Math.floor(Math.random() * allowed.length)];
-
-                // Reset positions
-                cam = { x: 0, y: 0, z: 0, w: 0, yaw: 0, pitch: 0, ana: 0 };
-                startCam = { x: 0, y: 0, z: 0, w: 0, yaw: 0 };
-
-                // Build Random Path Legs
-                pathLegs = [];
-                var totalTurn = 0;
-                var totalDist = 0;
-
-                for (var i = 0; i < params.legs; i++) {
-                    var legTurn = (Math.random() - 0.5) * params.turnSpread;
-                    var legPitch = params.dim >= 3 ? (Math.random() - 0.5) * (params.turnSpread * 0.4) : 0;
-                    var legAna = params.dim >= 4 ? (Math.random() - 0.5) * (params.turnSpread * 0.4) : 0;
-                    var legDist = 6 + Math.random() * 8;
-
-                    pathLegs.push({ turn: legTurn, pitch: legPitch, ana: legAna, dist: legDist });
-                    totalTurn += legTurn;
-                    totalDist += legDist;
-                }
-
-                givenTurn = totalTurn;
-                givenDist = totalDist;
-
-                currentLegIdx = 0;
-                legProgress = 0;
-                travelStartTime = Date.now();
-
-                state.phase = 'TRAVEL';
-                feedbackEl.textContent = '';
-                feedbackEl.className = 'feedback';
-                updateUI();
-            }
-
-            function processTravelPhase(dt, params) {
-                if (currentLegIdx >= pathLegs.length) {
-                    endCam = { x: cam.x, y: cam.y, z: cam.z, w: cam.w, yaw: cam.yaw };
-                    if (params.delay > 0) {
-                        state.phase = 'DELAY';
-                        setTimeout(function () {
-                            enterReportPhase();
-                        }, params.delay);
-                    } else {
-                        enterReportPhase();
-                    }
-                    return;
-                }
-
-                var leg = pathLegs[currentLegIdx];
-                // Variable speed jitter simulation
-                var timeElapsed = (Date.now() - travelStartTime) * 0.001;
-                var speedJitter = 1.0 + Math.sin(timeElapsed * 3.5) * params.jitter;
-                var speed = (8.0 + params.accel * 5.0) * speedJitter;
-                travelSpeed = speed;
-
-                var distStep = speed * dt;
-                legProgress += distStep;
-
-                // Rotate linearly over leg progress
-                var frac = Math.min(1.0, distStep / leg.dist);
-                cam.yaw += leg.turn * frac;
-                if (params.dim >= 3) cam.pitch += leg.pitch * frac;
-                if (params.dim >= 4) cam.ana += leg.ana * frac;
-
-                // Translate along camera orientation vector
-                var cY = Math.cos(cam.yaw), sY = Math.sin(cam.yaw);
-                var cP = Math.cos(cam.pitch), sP = Math.sin(cam.pitch);
-
-                cam.x += sY * cP * distStep;
-                cam.y += sP * distStep;
-                cam.z += cY * cP * distStep;
-                if (params.dim >= 4) {
-                    cam.w += Math.sin(cam.ana) * distStep;
-                }
-
-                updateAudio(travelSpeed);
-
-                if (legProgress >= leg.dist) {
-                    currentLegIdx++;
-                    legProgress = 0;
-                }
-            }
-
-            function enterReportPhase() {
-                state.phase = 'REPORT';
-                stopAudio();
-
-                // Position camera orientation depending on task type
-                if (state.task === 'angle') {
-                    cam.yaw = startCam.yaw; // Reset rotation so user reproduces total turn
-                } else if (state.task === 'distance') {
-                    // Lock position for distance measurement
-                }
-
-                updateUI();
-            }
-
-            function processUserSteering(dt) {
-                var rotateSpeed = 1.4 * dt;
-                var moveSpeed = 10.0 * dt;
-                var curSpd = 0;
-
-                if (keys['ArrowLeft']) cam.yaw -= rotateSpeed;
-                if (keys['ArrowRight']) cam.yaw += rotateSpeed;
-
-                if (activeActiveDim >= 3) {
-                    if (keys['ArrowUp']) cam.pitch += rotateSpeed;
-                    if (keys['ArrowDown']) cam.pitch -= rotateSpeed;
-                }
-
-                if (activeActiveDim >= 4) {
-                    if (keys['KeyQ'] || isAnaMinus) cam.ana -= rotateSpeed;
-                    if (keys['KeyE'] || isAnaPlus) cam.ana += rotateSpeed;
-                }
-
-                if (isMoving || keys['Space'] || keys['KeyW']) {
-                    curSpd = moveSpeed;
-                } else if (isBacking || keys['KeyS']) {
-                    curSpd = -moveSpeed;
-                }
-
-                if (curSpd !== 0) {
-                    var cY = Math.cos(cam.yaw), sY = Math.sin(cam.yaw);
-                    var cP = Math.cos(cam.pitch), sP = Math.sin(cam.pitch);
-                    cam.x += sY * cP * curSpd;
-                    cam.y += sP * curSpd;
-                    cam.z += cY * cP * curSpd;
-                    if (activeActiveDim >= 4) cam.w += Math.sin(cam.ana) * curSpd;
-                }
-
-                updateAudio(curSpd);
-            }
-
-            function evaluateTrial() {
-                var score = 0;
-                var detail = '';
-
-                if (state.task === 'angle') {
-                    var userTurn = cam.yaw - startCam.yaw;
-                    var err = Math.abs(userTurn - givenTurn);
-                    score = Math.max(0, 100 * (1.0 - err / (Math.PI * 0.75)));
-                    detail = 'Turn err: ' + (err * (180 / Math.PI)).toFixed(1) + '°';
-                } else if (state.task === 'distance') {
-                    var dx = cam.x - endCam.x;
-                    var dy = cam.y - endCam.y;
-                    var dz = cam.z - endCam.z;
-                    var dw = cam.w - endCam.w;
-                    var userDist = Math.sqrt(dx * dx + dy * dy + dz * dz + dw * dw);
-                    var errD = Math.abs(userDist - givenDist);
-                    score = Math.max(0, 100 * (1.0 - errD / givenDist));
-                    detail = 'Dist err: ' + errD.toFixed(1) + 'm (Target: ' + givenDist.toFixed(1) + 'm)';
-                } else if (state.task === 'homing') {
-                    // Vector from end back to origin (start)
-                    var targetYaw = Math.atan2(-endCam.x, -endCam.z);
-                    var diffYaw = Math.abs(normalizeAngle(cam.yaw - targetYaw));
-                    score = Math.max(0, 100 * (1.0 - diffYaw / Math.PI));
-                    detail = 'Bearing err: ' + (diffYaw * (180 / Math.PI)).toFixed(1) + '°';
-                } else if (state.task === 'return') {
-                    // Renav vector to origin (0,0,0,0)
-                    var distFromStart = Math.sqrt(cam.x * cam.x + cam.y * cam.y + cam.z * cam.z + cam.w * cam.w);
-                    var originalDist = Math.sqrt(endCam.x * endCam.x + endCam.y * endCam.y + endCam.z * endCam.z + endCam.w * endCam.w);
-                    score = Math.max(0, 100 * (1.0 - distFromStart / (originalDist || 1)));
-                    detail = 'Missed origin by: ' + distFromStart.toFixed(1) + 'm';
-                }
-
-                score = Math.min(100, Math.max(0, Math.round(score)));
-                var success = score >= 70;
-
-                // Handle Staircase Logic
-                if (state.adaptMode === 'auto') {
-                    if (success) {
-                        state.consecutiveWins++;
-                        if (state.consecutiveWins >= 2) {
-                            adjustLevel(0.2 * state.stepSize);
-                            state.consecutiveWins = 0;
-                            registerReversal(1);
-                        }
-                    } else {
-                        state.consecutiveWins = 0;
-                        adjustLevel(-0.25 * state.stepSize);
-                        registerReversal(-1);
-                    }
-                }
-
-                // Update Stats
-                if (success) {
-                    state.streak++;
-                    if (state.streak > state.bestStreak) state.bestStreak = state.streak;
-                } else {
-                    state.streak = 0;
-                }
-
-                state.history.push({
-                    score: score,
-                    level: state.level,
-                    task: state.task,
-                    date: Date.now()
-                });
-
-                saveData();
-
-                // UI Feedback
-                feedbackEl.textContent = 'Score: ' + score + '% — ' + detail;
-                if (score >= 80) feedbackEl.className = 'feedback good';
-                else if (score >= 60) feedbackEl.className = 'feedback mid';
-                else feedbackEl.className = 'feedback poor';
-
-                state.phase = 'FEEDBACK';
-                updateUI();
-            }
-
-            function normalizeAngle(a) {
-                while (a > Math.PI) a -= Math.PI * 2;
-                while (a < -Math.PI) a += Math.PI * 2;
-                return a;
-            }
-
-            function adjustLevel(delta) {
-                state.level = Math.max(1.0, Math.min(10.0, parseFloat((state.level + delta).toFixed(2))));
-            }
-
-            function registerReversal(dir) {
-                if (state.lastDir !== 0 && state.lastDir !== dir) {
-                    state.reversals.push(state.level);
-                    if (state.reversals.length % 2 === 0) {
-                        state.stepSize = Math.max(0.1, state.stepSize * 0.7);
-                    }
-                }
-                state.lastDir = dir;
-            }
-
-            function getAvailableTasks() {
-                var lvl = state.level;
-                var pool = [];
-                if (state.userTasks.angle) pool.push('angle');
-                if (state.userTasks.distance) pool.push('distance');
-                if (lvl >= 2.0 && state.userTasks.homing) pool.push('homing');
-                if (lvl >= 3.0 && state.userTasks.return) pool.push('return');
-                return pool;
-            }
-
-            // Interface & UI Syncing
-            function updateUI() {
-                var params = getParams();
-
-                // Level Badges
-                levelBadge.textContent = state.level.toFixed(1);
-                levelSetVal.textContent = state.level.toFixed(1);
-
-                // Mode and Dimension Tags
-                modeTag.textContent = state.task.toUpperCase();
-                dimTag.textContent = params.dim + 'D';
-
-                if (params.dim >= 4) {
-                    wLegend.classList.remove('hidden');
-                    cueLabel.classList.remove('hidden');
-                    cueSeg.classList.remove('hidden');
-                    auxRow.classList.remove('hidden');
-                } else {
-                    wLegend.classList.add('hidden');
-                    cueLabel.classList.add('hidden');
-                    cueSeg.classList.add('hidden');
-                    auxRow.classList.add('hidden');
-                }
-
-                // Readiness & Status Labels
-                phaseLabel.textContent = state.phase;
-                rightStatus.textContent = 'DIM: ' + params.dim + 'D';
-
-                // Controls visibility per phase
-                if (state.phase === 'READY') {
-                    overlay.innerHTML = '<span>Press <b>Travel</b> to begin.</span>';
-                    mainBtn.textContent = 'Travel';
-                    mainBtn.className = 'primary';
-                    mainBtn.disabled = false;
-                    moveBtn.classList.add('hidden');
-                    backBtn.classList.add('hidden');
-                    keyhint.innerHTML = 'Press <kbd>Enter</kbd> or click Travel';
-                } else if (state.phase === 'TRAVEL') {
-                    overlay.innerHTML = '<span>Observing path flow...</span>';
-                    mainBtn.disabled = true;
-                    keyhint.innerHTML = 'Observe optic flow movement';
-                } else if (state.phase === 'DELAY') {
-                    overlay.innerHTML = '<span>Hold position...</span>';
-                    mainBtn.disabled = true;
-                } else if (state.phase === 'REPORT') {
-                    overlay.innerHTML = '';
-                    mainBtn.textContent = 'Confirm';
-                    mainBtn.className = 'primary';
-                    mainBtn.disabled = false;
-
-                    if (state.task === 'angle' || state.task === 'homing') {
-                        moveBtn.classList.add('hidden');
-                        backBtn.classList.add('hidden');
-                        keyhint.innerHTML = 'Turn with <kbd>&larr;</kbd><kbd>&rarr;</kbd> or drag stage';
-                    } else {
-                        moveBtn.classList.remove('hidden');
-                        backBtn.classList.remove('hidden');
-                        keyhint.innerHTML = 'Move with <kbd>W</kbd>/<kbd>S</kbd> or Hold to move buttons';
-                    }
-                } else if (state.phase === 'FEEDBACK') {
-                    overlay.innerHTML = '<span>Trial Complete</span>';
-                    mainBtn.textContent = 'Next Trial';
-                    mainBtn.className = 'primary';
-                    mainBtn.disabled = false;
-                    moveBtn.classList.add('hidden');
-                    backBtn.classList.add('hidden');
-                    keyhint.innerHTML = 'Press <kbd>Enter</kbd> to continue';
-                }
-
-                // Sync Readouts
-                segReadout.textContent = params.legs;
-                jitReadout.textContent = Math.round(params.jitter * 100) + '%';
-                turnReadout.textContent = params.turnSpread.toFixed(2) + ' rad';
-                accelReadout.textContent = Math.round(params.accel * 100);
-                flowReadout.textContent = params.flowDensity;
-                delayReadout.textContent = (params.delay / 1000).toFixed(1) + 's';
-
-                // Update Task Pool Text
-                var avail = getAvailableTasks();
-                poolInfo.textContent = 'Active pool: ' + (avail.length ? avail.join(', ') : 'None');
-
-                // Unlock/Lock Task Chips
-                var chipBtns = document.querySelectorAll('#taskChips button');
-                chipBtns.forEach(function (btn) {
-                    var t = btn.getAttribute('data-task');
-                    var locked = (t === 'homing' && state.level < 2.0) || (t === 'return' && state.level < 3.0);
-                    if (locked) {
-                        btn.classList.add('locked');
-                    } else {
-                        btn.classList.remove('locked');
-                    }
-                    if (state.userTasks[t]) btn.classList.add('on');
-                    else btn.classList.remove('on');
-                });
-
-                // Stats Update
-                streakVal.textContent = state.streak;
-                bestVal.textContent = state.bestStreak;
-                trialsVal.textContent = state.history.length;
-
-                if (state.history.length > 0) {
-                    var sum = 0;
-                    for (var i = 0; i < state.history.length; i++) sum += state.history[i].score;
-                    avgVal.textContent = Math.round(sum / state.history.length) + '%';
-                } else {
-                    avgVal.textContent = '–';
-                }
-
-                renderSparkline();
-                renderSummary();
-            }
-
-            function renderSparkline() {
-                if (!state.history.length) {
-                    sparkLine.setAttribute('points', '');
-                    return;
-                }
-                var pts = [];
-                var count = Math.min(30, state.history.length);
-                var start = state.history.length - count;
-                for (var i = 0; i < count; i++) {
-                    var item = state.history[start + i];
-                    var x = (i / (Math.max(1, count - 1))) * 240;
-                    var y = 32 - (item.score / 100) * 28 - 2;
-                    pts.push(x.toFixed(1) + ',' + y.toFixed(1));
-                }
-                sparkLine.setAttribute('points', pts.join(' '));
+            function restore() {
+                var raw = Store.get(SAVE_KEY);
+                if (!raw) return false;
+                try {
+                    var d = JSON.parse(raw);
+                    if (typeof d.levelF === 'number' && isFinite(d.levelF)) { levelF = Math.max(1, d.levelF); level = levelF; }
+                    if (d.pathMode) pathMode = d.pathMode;
+                    if (typeof d.dimPin === 'number') dimPin = d.dimPin;
+                    if (typeof d.audioOn === 'boolean') audioOn = d.audioOn;
+                    if (typeof d.pulse4d === 'boolean') pulse4d = d.pulse4d;
+                    if (d.enabledTasks) MODES.forEach(function (m) {
+                        if (typeof d.enabledTasks[m] === 'boolean') enabledTasks[m] = d.enabledTasks[m];
+                    });
+                    if (d.taskStats) MODES.forEach(function (m) {
+                        if (d.taskStats[m]) taskStats[m] = d.taskStats[m];
+                    });
+                    if (typeof d.trials === 'number') trials = d.trials;
+                    if (typeof d.best === 'number') best = d.best;
+                    if (Array.isArray(d.reversals)) scReversals = d.reversals;
+                    if (typeof d.step === 'number') scStep = d.step;
+                    return true;
+                } catch (e) { return false; }
             }
 
             function renderSummary() {
-                if (!state.history.length) {
-                    summaryEl.innerHTML = '<i>No trials completed in this session yet.</i>';
-                    return;
-                }
-                var last = state.history[state.history.length - 1];
-                var html = '<div class="big"><div><small>Last Score</small><span>' + last.score + '%</span></div>' +
-                    '<div><small>Target</small><span>' + last.task + '</span></div></div>';
-                html += '<table>';
-                html += '<tr><td>Level estimate</td><td>' + state.level.toFixed(2) + '</td></tr>';
-                html += '<tr><td>Total completed</td><td>' + state.history.length + '</td></tr>';
-                html += '</table>';
-                summaryEl.innerHTML = html;
+                var totN = 0, totC = 0, totS = 0;
+                MODES.forEach(function (m) { var t = taskStats[m]; totN += t.n; totC += t.correct; totS += t.sum; });
+                var acc = totN ? (totC / totN * 100) : 0;
+                var mean = totN ? (totS / totN * 100) : 0;
+                var thr = thresholdEstimate();
+
+                var rows = '';
+                MODES.forEach(function (m) {
+                    var t = taskStats[m];
+                    if (!t.n) return;
+                    rows += '<tr><td>' + TASK_META[m].label + '</td><td>' + t.n + ' trials &middot; ' +
+                        (t.correct / t.n * 100).toFixed(0) + '% &middot; mean ' + (t.sum / t.n * 100).toFixed(0) + '%</td></tr>';
+                });
+                if (!rows) rows = '<tr><td colspan="2">no trials yet</td></tr>';
+
+                summaryEl.innerHTML =
+                    '<div class="big">' +
+                    '<div><small>Level</small><span>' + (adaptMode === 'auto' ? levelF.toFixed(1) : 'man') + '</span></div>' +
+                    '<div><small>Accuracy</small><span>' + acc.toFixed(0) + '%</span></div>' +
+                    '<div><small>Mean score</small><span>' + mean.toFixed(0) + '%</span></div>' +
+                    '<div><small>Trials</small><span>' + totN + '</span></div>' +
+                    '</div><table>' + rows +
+                    (thr !== null ? '<tr><td>Threshold</td><td>&asymp; level ' + thr.toFixed(1) + '</td></tr>' : '') +
+                    '</table>';
+
+                storageNote.textContent = Store.persistent
+                    ? 'Saved on this device only \u2014 nothing leaves your browser.'
+                    : 'Storage unavailable here, so this session is kept in memory only.';
             }
 
-            // User Input & Listeners Setup
-            function setupEvents() {
-                window.addEventListener('resize', resizeCanvas);
+            function setLevel(v) {
+                levelF = Math.max(1, Math.round(v * 10) / 10);
+                level = levelF;
+                // a manual jump invalidates the reversal history, so restart the staircase cleanly
+                scRun = 0; scLastDir = 0; scStep = 1.0; scReversals = [];
+                P = deriveParams(levelF);
+                syncReadouts(); refreshChips(); updateStairReadout(); renderSummary();
+                levelBadge.textContent = levelF.toFixed(1);
+                levelSetVal.textContent = levelF.toFixed(1);
+                persist();
+            }
 
-                // Main Button Action
-                mainBtn.addEventListener('click', function () {
-                    initAudio();
-                    if (state.phase === 'READY' || state.phase === 'FEEDBACK') {
-                        startTrial();
-                    } else if (state.phase === 'REPORT') {
-                        evaluateTrial();
+            function thresholdEstimate() {
+                if (scReversals.length < THR_WINDOW) return null;
+                var last = scReversals.slice(-THR_WINDOW);
+                return last.reduce(function (a, b) { return a + b; }, 0) / last.length;
+            }
+            function updateStairReadout() {
+                var thr = thresholdEstimate();
+                var target = Math.pow(0.5, 1 / SC_RULE);
+                stairInfo.innerHTML =
+                    'holding ' + (target * 100).toFixed(0) + '% success &middot; step ' + scStep.toFixed(2) +
+                    ' &middot; reversals ' + scReversals.length +
+                    (thr !== null ? ' &middot; threshold &asymp; ' + thr.toFixed(1) : '');
+            }
+
+            function drawSpark() {
+                var src = (adaptMode === 'auto' && levelTrace.length) ? levelTrace : history;
+                if (!src.length) { sparkLine.setAttribute('points', ''); return; }
+                var w = 240, h = 32, n = src.length;
+                var lo, hi;
+                if (src === levelTrace) {
+                    lo = Math.min.apply(null, src); hi = Math.max.apply(null, src);
+                    if (hi - lo < 1) { hi = lo + 1; }
+                } else { lo = 0; hi = 1; }
+                var pts = src.map(function (s, i) {
+                    var x = n === 1 ? w : i * (w / (HIST_MAX - 1));
+                    var y = h - clamp((s - lo) / (hi - lo), 0, 1) * h;
+                    return x.toFixed(1) + ',' + y.toFixed(1);
+                });
+                sparkLine.setAttribute('points', pts.join(' '));
+            }
+
+            // ============ loop ============
+            function loop(ts) {
+                rafId = requestAnimationFrame(loop);
+                if (!lastTs) lastTs = ts;
+                var dt = Math.min(0.05, (ts - lastTs) / 1000);
+                lastTs = ts;
+                nowT += dt;
+
+                if (phase === 'travel') { if (isActiveTrial()) stepActiveTravel(dt); else stepTravel(dt); }
+                else if (phase === 'delay') { if (performance.now() >= delayUntil) { overlay.textContent = ''; beginRespond(); } }
+                else if (phase === 'respond') stepRespond(dt);
+
+                if (phase === 'travel' || phase === 'respond') refreshDots(dt);
+                render();
+            }
+
+            // ============ turning input ============
+            function applyTurn(dx, dy) {
+                if (!canTurn()) return;
+                var yaw = dx * 0.006;
+                rotateBasis(basis, 0, 1, yaw);
+                responseTurn += yaw;
+                if (dims >= 3 && trialMode !== 'angle' && Math.abs(dy) > 0.01) rotateBasis(basis, 0, 2, -dy * 0.005);
+                orthonormalize(basis);
+            }
+            var dragging = false, lastX = 0, lastY = 0;
+            stage.addEventListener('pointerdown', function (e) {
+                if (!canTurn()) return;
+                dragging = true; lastX = e.clientX; lastY = e.clientY;
+                stage.setPointerCapture(e.pointerId);
+            });
+            stage.addEventListener('pointermove', function (e) {
+                if (!dragging) return;
+                applyTurn(e.clientX - lastX, e.clientY - lastY);
+                lastX = e.clientX; lastY = e.clientY;
+            });
+            stage.addEventListener('pointerup', function () { dragging = false; });
+            stage.addEventListener('pointercancel', function () { dragging = false; });
+
+            window.addEventListener('keydown', function (e) {
+                if (e.repeat && e.code !== 'Space' && e.code !== 'KeyW') { /* allow held turn keys */ }
+                var k = e.code;
+                if (k === 'ArrowLeft' || k === 'KeyA') { applyTurn(-14, 0); e.preventDefault(); }
+                else if (k === 'ArrowRight' || k === 'KeyD') { applyTurn(14, 0); e.preventDefault(); }
+                else if (k === 'ArrowUp' && dims >= 3) { applyTurn(0, -12); e.preventDefault(); }
+                else if (k === 'ArrowDown' && dims >= 3) { applyTurn(0, 12); e.preventDefault(); }
+                else if (k === 'KeyQ' && dims >= 4 && canTurn()) { rotateBasis(basis, 0, 3, -0.12); orthonormalize(basis); e.preventDefault(); }
+                else if (k === 'KeyE' && dims >= 4 && canTurn()) { rotateBasis(basis, 0, 3, 0.12); orthonormalize(basis); e.preventDefault(); }
+                else if (k === 'Space' || k === 'KeyW') {
+                    if (canMove()) { moveDir = 1; moving = true; moveBtn.classList.add('pressed'); }
+                    e.preventDefault();
+                }
+                else if (k === 'KeyS') {
+                    if (canMove()) { moveDir = -1; moving = true; backBtn.classList.add('pressed'); }
+                    e.preventDefault();
+                }
+                else if (k === 'Enter' || k === 'NumpadEnter') {
+                    e.preventDefault();
+                    if (phase === 'ready') beginTravel();
+                    else if (phase === 'respond') submit();
+                    else if (phase === 'feedback') startTrial();
+                }
+            });
+            window.addEventListener('keyup', function (e) {
+                if (e.code === 'Space' || e.code === 'KeyW') {
+                    if (moveDir === 1) { moveDir = 0; moving = false; }
+                    moveBtn.classList.remove('pressed');
+                } else if (e.code === 'KeyS') {
+                    if (moveDir === -1) { moveDir = 0; moving = false; }
+                    backBtn.classList.remove('pressed');
+                }
+            });
+
+            function holdBind(el, dir) {
+                function down(e) { e.preventDefault(); if (canMove()) { moveDir = dir; moving = true; el.classList.add('pressed'); } }
+                function up() { if (moveDir === dir) { moveDir = 0; moving = false; } el.classList.remove('pressed'); }
+                el.addEventListener('pointerdown', down);
+                el.addEventListener('pointerup', up);
+                el.addEventListener('pointerleave', up);
+                el.addEventListener('pointercancel', up);
+            }
+            function isActiveTrial() {
+                // self-driven outbound path only makes sense when you must recover the origin
+                return pathMode === 'active' && (trialMode === 'homing' || trialMode === 'return');
+            }
+            function canMove() {
+                if (phase === 'travel') return isActiveTrial();
+                return phase === 'respond' &&
+                    (trialMode === 'distance' || (trialMode === 'return' && returnStage === 1));
+            }
+            function canTurn() {
+                if (phase === 'travel') return isActiveTrial();
+                if (phase !== 'respond') return false;
+                if (trialMode === 'distance') return false;
+                if (trialMode === 'return' && returnStage === 1) return false;
+                return true;
+            }
+            function refreshControls() {
+                var mv = canMove();
+                moveBtn.classList.toggle('hidden', !mv);
+                backBtn.classList.toggle('hidden', !mv);
+                if (!mv) {
+                    moving = false; moveDir = 0;
+                    moveBtn.classList.remove('pressed'); backBtn.classList.remove('pressed');
+                }
+
+                var hint = '';
+                if (phase === 'ready') hint = '<kbd>Enter</kbd> travel';
+                else if (phase === 'travel') hint = isActiveTrial()
+                    ? 'drive to the marker &mdash; <kbd>&larr;</kbd><kbd>&rarr;</kbd> turn, <kbd>W</kbd> forward, <kbd>S</kbd> back'
+                    : 'watch &mdash; you are being moved';
+                else if (phase === 'delay') hint = 'hold it';
+                else if (phase === 'respond') {
+                    if (mv) hint = 'hold <kbd>W</kbd> forward, <kbd>S</kbd> back &middot; <kbd>Enter</kbd> confirm';
+                    else {
+                        hint = 'drag the view, or <kbd>&larr;</kbd><kbd>&rarr;</kbd> to turn';
+                        if (dims >= 3 && trialMode !== 'angle') hint += ' &middot; <kbd>&uarr;</kbd><kbd>&darr;</kbd> pitch';
+                        if (dims >= 4 && trialMode !== 'angle') hint += ' &middot; <kbd>Q</kbd><kbd>E</kbd> ana';
+                        hint += ' &middot; <kbd>Enter</kbd> confirm';
                     }
-                });
+                }
+                else if (phase === 'feedback') hint = '<kbd>Enter</kbd> next trial';
+                keyhint.innerHTML = hint;
+            }
 
-                // Touch & Drag Controls on Canvas Stage
-                stageEl.addEventListener('pointerdown', function (e) {
-                    if (state.phase !== 'REPORT') return;
-                    isDragging = true;
-                    dragStart = { x: e.clientX, y: e.clientY };
-                    stageEl.setPointerCapture(e.pointerId);
-                });
+            mainBtn.addEventListener('click', function () {
+                if (phase === 'ready') beginTravel();
+                else if (phase === 'respond') submit();
+                else if (phase === 'feedback') startTrial();
+            });
+            holdBind(moveBtn, 1);
+            holdBind(backBtn, -1);
 
-                stageEl.addEventListener('pointermove', function (e) {
-                    if (!isDragging || state.phase !== 'REPORT') return;
-                    var dx = e.clientX - dragStart.x;
-                    var dy = e.clientY - dragStart.y;
-                    dragStart = { x: e.clientX, y: e.clientY };
+            anaMinus.addEventListener('click', function () { if (dims >= 4 && canTurn()) { rotateBasis(basis, 0, 3, -0.12); orthonormalize(basis); } });
+            anaPlus.addEventListener('click', function () { if (dims >= 4 && canTurn()) { rotateBasis(basis, 0, 3, 0.12); orthonormalize(basis); } });
 
-                    cam.yaw += dx * 0.005;
-                    if (activeActiveDim >= 3) {
-                        cam.pitch -= dy * 0.005;
-                    }
-                });
-
-                var stopDrag = function (e) {
-                    isDragging = false;
-                };
-                stageEl.addEventListener('pointerup', stopDrag);
-                stageEl.addEventListener('pointercancel', stopDrag);
-
-                // Hold Movement Buttons
-                var setMove = function (pressed) {
-                    isMoving = pressed;
-                    if (pressed) moveBtn.classList.add('pressed');
-                    else moveBtn.classList.remove('pressed');
-                };
-                var setBack = function (pressed) {
-                    isBacking = pressed;
-                    if (pressed) backBtn.classList.add('pressed');
-                    else backBtn.classList.remove('pressed');
-                };
-
-                moveBtn.addEventListener('pointerdown', function (e) { initAudio(); setMove(true); moveBtn.setPointerCapture(e.pointerId); });
-                moveBtn.addEventListener('pointerup', function () { setMove(false); });
-                moveBtn.addEventListener('pointercancel', function () { setMove(false); });
-
-                backBtn.addEventListener('pointerdown', function (e) { initAudio(); setBack(true); backBtn.setPointerCapture(e.pointerId); });
-                backBtn.addEventListener('pointerup', function () { setBack(false); });
-                backBtn.addEventListener('pointercancel', function () { setBack(false); });
-
-                // 4D Aux Controls
-                anaMinus.addEventListener('pointerdown', function () { isAnaMinus = true; });
-                anaMinus.addEventListener('pointerup', function () { isAnaMinus = false; });
-                anaPlus.addEventListener('pointerdown', function () { isAnaPlus = true; });
-                anaPlus.addEventListener('pointerup', function () { isAnaPlus = false; });
-
-                // Keyboard Listeners
-                window.addEventListener('keydown', function (e) {
-                    keys[e.code] = true;
-                    if (e.code === 'Enter' || e.code === 'Space') {
-                        if (document.activeElement.tagName !== 'BUTTON' && document.activeElement.tagName !== 'INPUT') {
-                            if (state.phase === 'READY' || state.phase === 'FEEDBACK') {
-                                initAudio();
-                                startTrial();
-                                e.preventDefault();
-                            } else if (state.phase === 'REPORT' && e.code === 'Enter') {
-                                evaluateTrial();
-                                e.preventDefault();
-                            }
-                        }
-                    }
-                });
-
-                window.addEventListener('keyup', function (e) {
-                    keys[e.code] = false;
-                });
-
-                // Task Selector Chips
-                document.getElementById('taskChips').addEventListener('click', function (e) {
-                    if (e.target.tagName === 'BUTTON') {
-                        var task = e.target.getAttribute('data-task');
-                        state.userTasks[task] = !state.userTasks[task];
-                        updateUI();
-                    }
-                });
-
-                // Segment Button Selectors
-                setupSegHandler('pathSeg', function (val) { state.pathType = val; });
-                setupSegHandler('dimSeg', function (val) { state.dimMode = parseInt(val, 10); updateUI(); });
-                setupSegHandler('adaptSeg', function (val) {
-                    state.adaptMode = val;
-                    if (val === 'manual') {
-                        sliderGroup.classList.remove('hidden');
-                        readoutGroup.classList.add('hidden');
-                        stairInfo.textContent = 'Manual parameter control mode';
-                    } else {
-                        sliderGroup.classList.add('hidden');
-                        readoutGroup.classList.remove('hidden');
-                        stairInfo.textContent = '2-down / 1-up Levitt staircase active';
-                    }
-                    updateUI();
-                });
-                setupSegHandler('cueSeg', function (val) { state.cue4D = val; });
-                setupSegHandler('audioSeg', function (val) { state.audio = val; if (val === 'off') stopAudio(); else initAudio(); });
-
-                // Manual Level Adjusters
-                document.getElementById('levelDown').addEventListener('click', function () { adjustLevel(-0.5); updateUI(); });
-                document.getElementById('levelUp').addEventListener('click', function () { adjustLevel(0.5); updateUI(); });
-
-                // Reset Session Button
-                document.getElementById('resetBtn').addEventListener('click', function () {
-                    if (confirm('Reset session stats and wipe local history?')) {
-                        localStorage.removeItem('dead_reckoning_data');
-                        state.history = [];
-                        state.streak = 0;
-                        state.bestStreak = 0;
-                        state.level = 1.0;
-                        state.consecutiveWins = 0;
-                        state.reversals = [];
-                        updateUI();
-                    }
-                });
-
-                // Slider bindings
-                var bindSlider = function (slider, out, fmt) {
-                    slider.addEventListener('input', function () {
-                        out.value = fmt(slider.value);
-                        updateUI();
+            // ============ segmented controls ============
+            function bindSeg(el, attr, cb) {
+                Array.prototype.forEach.call(el.querySelectorAll('button'), function (b) {
+                    b.addEventListener('click', function () {
+                        Array.prototype.forEach.call(el.querySelectorAll('button'), function (x) { x.classList.remove('active'); });
+                        b.classList.add('active');
+                        cb(b.getAttribute(attr));
                     });
-                };
-                bindSlider(dimSlider, dimOut, function (v) { return v + 'D'; });
-                bindSlider(segSlider, segOut, function (v) { return v; });
-                bindSlider(jitSlider, jitOut, function (v) { return v + '%'; });
-                bindSlider(accelSlider, accelOut, function (v) { return (v / 100).toFixed(2); });
-                bindSlider(turnSlider, turnOut, function (v) { return (v / 100).toFixed(2) + ' rad'; });
-                bindSlider(flowSlider, flowOut, function (v) { return v; });
-                bindSlider(lifeSlider, lifeOut, function (v) { return (v / 10).toFixed(1) + 's'; });
-                bindSlider(delaySlider, delayOut, function (v) { return (v / 1000).toFixed(1) + 's'; });
-
-                // Scroll Cue trigger
-                window.addEventListener('scroll', function () {
-                    var scrollCue = document.getElementById('scrollCue');
-                    if (!scrollCue) return;
-                    if (window.innerHeight + window.scrollY < document.body.offsetHeight - 80) {
-                        scrollCue.classList.add('show');
-                    } else {
-                        scrollCue.classList.remove('show');
-                    }
                 });
             }
-
-            function setupSegHandler(id, cb) {
-                var container = document.getElementById(id);
-                if (!container) return;
-                container.addEventListener('click', function (e) {
-                    if (e.target.tagName === 'BUTTON') {
-                        var btns = container.querySelectorAll('button');
-                        btns.forEach(function (b) { b.classList.remove('active'); });
-                        e.target.classList.add('active');
-                        var val = e.target.getAttribute('data-' + id.replace('Seg', ''));
-                        cb(val);
-                    }
-                });
-            }
-
-            // Main Engine Loop
-            var lastTime = performance.now();
-            function frame(now) {
-                var dt = Math.min(0.1, (now - lastTime) / 1000);
-                lastTime = now;
-
-                var params = getParams();
-
-                if (state.phase === 'TRAVEL') {
-                    processTravelPhase(dt, params);
-                } else if (state.phase === 'REPORT') {
-                    processUserSteering(dt);
+            bindSeg(pathSeg, 'data-path', function (v) { pathMode = v; persist(); startTrial(); });
+            bindSeg(cueSeg, 'data-cue', function (v) { pulse4d = (v === 'pulse'); persist(); });
+            bindSeg(dimSeg, 'data-dim', function (v) {
+                dimPin = Number(v);
+                P = (adaptMode === 'auto') ? deriveParams(levelF) : paramsFromSliders();
+                syncReadouts(); persist(); startTrial();
+            });
+            bindSeg(adaptSeg, 'data-adapt', function (v) {
+                adaptMode = v;
+                sliderGroup.classList.toggle('hidden', v !== 'manual');
+                readoutGroup.classList.toggle('hidden', v !== 'auto');
+                levelRow.classList.toggle('hidden', v !== 'auto');
+                stairInfo.classList.toggle('hidden', v !== 'auto');
+                if (v === 'manual') {
+                    var d = deriveParams(levelF);
+                    accelSlider.value = Math.round(d.accel * 100);
+                    turnSlider.value = Math.round(d.turnHi * 100);
+                    dimSlider.value = d.dims; segSlider.value = d.legs;
+                    jitSlider.value = Math.round(d.jitter * 100); flowSlider.value = d.flow;
+                    lifeSlider.value = Math.round(d.life * 10); delaySlider.value = Math.round(d.delay / 250) * 250;
+                    syncSliderOutputs();
+                    P = paramsFromSliders();
+                    levelBadge.textContent = 'Man';
+                } else {
+                    P = deriveParams(levelF); syncReadouts(); levelBadge.textContent = levelF.toFixed(1);
+                    levelSetVal.textContent = levelF.toFixed(1); updateStairReadout();
                 }
+                refreshChips(); renderSummary(); persist();
+            });
+            [dimSlider, segSlider, jitSlider, accelSlider, turnSlider, flowSlider, lifeSlider, delaySlider].forEach(function (sl) {
+                sl.addEventListener('input', function () {
+                    if (adaptMode !== 'manual') return;
+                    var prevDims = P.dims;
+                    P = paramsFromSliders(); syncSliderOutputs();
+                    // dimensionality is baked in when a trial is built, so restart the trial
+                    // immediately rather than leaving the slider looking inert
+                    if (P.dims !== prevDims) startTrial();
+                });
+            });
 
-                updateAndRenderDots(dt, params);
-                requestAnimationFrame(frame);
-            }
+            Array.prototype.forEach.call(taskChips.querySelectorAll('button'), function (b) {
+                b.addEventListener('click', function () {
+                    var k = b.getAttribute('data-task');
+                    var on = MODES.filter(function (m) { return enabledTasks[m]; });
+                    if (enabledTasks[k] && on.length === 1) return;   // never leave zero types selected
+                    enabledTasks[k] = !enabledTasks[k];
+                    refreshChips(); persist(); startTrial();
+                });
+            });
+            levelDown.addEventListener('click', function () { setLevel(levelF - 1); startTrial(); });
+            levelUp.addEventListener('click', function () { setLevel(levelF + 1); startTrial(); });
 
-            // Initialization Sequence
-            loadSavedData();
+            resetBtn.addEventListener('click', function () {
+                level = 1; levelF = 1.0; history = []; levelTrace = []; trials = 0; streak = 0; best = 0;
+                scRun = 0; scLastDir = 0; scStep = STEP0; scReversals = [];
+                avgVal.textContent = '–'; trialsVal.textContent = '0'; streakVal.textContent = '0'; bestVal.textContent = '0';
+                feedbackEl.textContent = ''; drawSpark();
+                MODES.forEach(function (m) { taskStats[m] = { n: 0, sum: 0, correct: 0 }; });
+                Store.del(SAVE_KEY);
+                if (adaptMode === 'auto') { P = deriveParams(1); syncReadouts(); levelBadge.textContent = '1.0'; updateStairReadout(); }
+                levelSetVal.textContent = '1.0';
+                refreshChips(); renderSummary();
+                startTrial();
+            });
+
+            // ============ init ============
             resizeCanvas();
-            initDots(150);
-            setupEvents();
-            updateUI();
-            requestAnimationFrame(frame);
+            restore();
+            // reflect restored settings in the controls
+            Array.prototype.forEach.call(pathSeg.querySelectorAll('button'), function (b) {
+                b.classList.toggle('active', b.getAttribute('data-path') === pathMode);
+            });
+            Array.prototype.forEach.call(dimSeg.querySelectorAll('button'), function (b) {
+                b.classList.toggle('active', Number(b.getAttribute('data-dim')) === dimPin);
+            });
+            Array.prototype.forEach.call(audioSeg.querySelectorAll('button'), function (b) {
+                b.classList.toggle('active', (b.getAttribute('data-audio') === 'on') === audioOn);
+            });
+            Array.prototype.forEach.call(cueSeg.querySelectorAll('button'), function (b) {
+                b.classList.toggle('active', (b.getAttribute('data-cue') === 'pulse') === pulse4d);
+            });
+            P = deriveParams(levelF);
+            levelBadge.textContent = levelF.toFixed(1);
+            levelSetVal.textContent = levelF.toFixed(1);
+            syncSliderOutputs();
+            syncReadouts();
+            refreshChips();
+            renderSummary();
+            updateScrollCue();
+            updateStairReadout();
+            drawSpark();
+            startTrial();
+            refreshControls();
+            rafId = requestAnimationFrame(loop);
 
+            window.__pi = {
+                getPhase: function () { return phase; },
+                getMode: function () { return trialMode; },
+                getLevel: function () { return level; },
+                getParams: function () { return P; },
+                getDims: function () { return dims; },
+                getPos: function () { return pos.slice(); },
+                getTruth: function () { return truth; },
+                getBasis0: function () { return basis[0].slice(); },
+                getTravelled: function () { return travelledThisResponse; },
+                getPathDist: function () { return pathDist; },
+                getResponseTurn: function () { return responseTurn; },
+                getReturnStage: function () { return returnStage; },
+                getActiveIdx: function () { return activeIdx; },
+                getActiveTargets: function () { return activeTargets.map(function (t) { return t.slice(); }); },
+                getLevelF: function () { return levelF; },
+                getStair: function () { return { rule: SC_RULE, step: scStep, reversals: scReversals.slice(), run: scRun, lastDir: scLastDir }; },
+                aimAt: function (v) { basis[0] = vNorm(v.slice()); for (var i = 1; i < dims; i++) basis[i] = vAxis(dims, i); orthonormalize(basis); basis[0] = vNorm(v.slice()); orthonormalize(basis); },
+                setMoving: function (v) { moving = v; },
+                aimAtHome: function () {
+                    if (!truth) return false;
+                    // rotate basis so forward == homeDir, exactly (test helper)
+                    var f = truth.homeDir.slice();
+                    basis[0] = f.slice();
+                    for (var i = 1; i < dims; i++) basis[i] = vAxis(dims, i);
+                    orthonormalize(basis);
+                    basis[0] = f.slice();
+                    orthonormalize(basis);
+                    return true;
+                },
+                forceSubmit: function () { submit(); },
+                forceNext: function () { startTrial(); }
+            };
         })();
     </script>
 </body>
